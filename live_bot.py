@@ -270,6 +270,7 @@ class NewsItem:
     link: str
     published: str
     source: str
+    original_title: str = ""
 
 
 # ============================================================
@@ -1715,17 +1716,19 @@ def analogue_statistics(
             )
         }
 
-    # ========================================================
-    # QO'SHIMCHA 1: +1%, +2%, +3%, +4%
-    # ========================================================
-
     profit_targets = {}
 
     for target in (
         1,
         2,
         3,
-        4
+        4,
+        5,
+        10,
+        15,
+        20,
+        30,
+        50
     ):
         hits = sum(
             1
@@ -1743,17 +1746,19 @@ def analogue_statistics(
             )
         }
 
-    # ========================================================
-    # QO'SHIMCHA 1: -1%, -2%, -3%, -4%
-    # ========================================================
-
     loss_targets = {}
 
     for target in (
         1,
         2,
         3,
-        4
+        4,
+        5,
+        10,
+        15,
+        20,
+        30,
+        50
     ):
         hits = sum(
             1
@@ -1786,14 +1791,10 @@ def analogue_statistics(
         "median_down":
             median_or_zero(down_moves),
         "targets": targets,
-
-        # QO'SHIMCHA STATISTIKALAR
         "profit_targets":
             profit_targets,
-
         "loss_targets":
             loss_targets,
-
         "avg_similarity":
             mean_or_zero([
                 a.similarity
@@ -2424,6 +2425,544 @@ def translate_news_to_uzbek(text):
         return text
 
 
+# ============================================================
+# QO'SHIMCHA: YANGILIK TA'SIRINI TAHLIL QILISH
+# ============================================================
+
+NEWS_ANALYSIS_CACHE = {}
+
+NEWS_ANALYSIS_LOCK = threading.RLock()
+
+
+def news_words(text):
+    text = clean_translation_text(
+        text
+    ).lower()
+
+    text = re.sub(
+        r"[^a-z0-9$%.\- ]+",
+        " ",
+        text
+    )
+
+    return text
+
+
+def calculate_news_impact(original_title):
+    """
+    Inglizcha RSS yangilik sarlavhasini to'g'ridan-to'g'ri
+    tahlil qiladi.
+
+    Natija:
+        - O'zbekcha qisqa xulosa
+        - Yuqoriga %
+        - Pastga %
+        - Neytral %
+        - Ta'sir kuchi
+
+    Bu foizlar yangilik sarlavhasidagi aniq ijobiy/salbiy
+    bozor signallariga asoslangan heuristik bahodir.
+    Bu narxning kafolatlangan kelajak prognozi emas.
+    """
+
+    title = clean_translation_text(
+        original_title
+    )
+
+    if not title:
+        return {
+            "summary": "Yangilik mazmuni aniqlanmadi.",
+            "up_pct": 33.33,
+            "down_pct": 33.33,
+            "neutral_pct": 33.34,
+            "impact": "PAST",
+            "direction": "NEUTRAL"
+        }
+
+    cache_key = title.lower()
+
+    with NEWS_ANALYSIS_LOCK:
+        cached = NEWS_ANALYSIS_CACHE.get(
+            cache_key
+        )
+
+    if cached:
+        return cached
+
+    text = news_words(title)
+
+    # ========================================================
+    # KUCHLI IJOBIY XABARLAR
+    # ========================================================
+
+    strong_positive = {
+        "approval": 4.0,
+        "approved": 4.0,
+        "etf approved": 5.0,
+        "etf approval": 5.0,
+        "adoption": 3.0,
+        "institutional adoption": 5.0,
+        "institutional buying": 5.0,
+        "institutional investment": 4.5,
+        "record inflows": 5.0,
+        "massive inflows": 5.0,
+        "surge": 4.0,
+        "soars": 4.5,
+        "rallies": 4.0,
+        "rally": 4.0,
+        "breakout": 3.0,
+        "bullish": 4.0,
+        "partnership": 2.5,
+        "strategic partnership": 3.5,
+        "major partnership": 4.0,
+        "integration": 2.5,
+        "launch": 2.0,
+        "mainstream": 3.0,
+        "institutional": 2.0,
+        "buying": 3.0,
+        "investment": 2.5,
+        "growth": 2.0,
+        "boost": 2.5,
+        "expands": 2.0,
+        "expansion": 2.0,
+        "upgrade": 2.0,
+        "successful upgrade": 3.0,
+        "record": 2.0,
+        "adopt": 2.5,
+        "adopts": 2.5,
+        "legal clarity": 3.0,
+        "regulatory clarity": 3.0,
+        "positive": 2.0
+    }
+
+    # ========================================================
+    # KUCHLI SALBIY XABARLAR
+    # ========================================================
+
+    strong_negative = {
+        "hack": 5.0,
+        "hacked": 5.0,
+        "exploit": 5.0,
+        "exploited": 5.0,
+        "stolen": 5.0,
+        "theft": 5.0,
+        "breach": 5.0,
+        "bankruptcy": 5.0,
+        "bankrupt": 5.0,
+        "collapse": 5.0,
+        "crash": 5.0,
+        "lawsuit": 3.0,
+        "indictment": 4.0,
+        "fraud": 5.0,
+        "scam": 5.0,
+        "ban": 4.5,
+        "banned": 4.5,
+        "shutdown": 4.5,
+        "shut down": 4.5,
+        "sanction": 4.0,
+        "sanctions": 4.0,
+        "rejected": 4.0,
+        "rejection": 4.0,
+        "liquidation": 5.0,
+        "liquidations": 5.0,
+        "outflows": 4.0,
+        "massive outflows": 5.0,
+        "selloff": 5.0,
+        "sell-off": 5.0,
+        "bearish": 4.0,
+        "falls": 3.5,
+        "fall": 3.0,
+        "drops": 3.5,
+        "drop": 3.0,
+        "plunge": 4.5,
+        "plunges": 4.5,
+        "warning": 2.0,
+        "risk": 1.5,
+        "risks": 1.5,
+        "negative": 2.0,
+        "investigation": 2.5,
+        "probe": 2.5
+    }
+
+    # ========================================================
+    # MACRO SALBIY
+    # ========================================================
+
+    macro_negative = {
+        "rate hike": 4.0,
+        "rate hikes": 4.0,
+        "higher rates": 3.5,
+        "interest rate hike": 4.0,
+        "hawkish": 4.0,
+        "hawkish fed": 4.5,
+        "inflation rises": 4.0,
+        "inflation rose": 4.0,
+        "hotter inflation": 4.0,
+        "cpi rises": 3.5,
+        "cpi rose": 3.5,
+        "strong jobs": 2.0,
+        "higher for longer": 4.0,
+        "tightening": 3.0
+    }
+
+    # ========================================================
+    # MACRO IJOBIY
+    # ========================================================
+
+    macro_positive = {
+        "rate cut": 4.5,
+        "rate cuts": 4.5,
+        "interest rate cut": 4.5,
+        "lower rates": 3.5,
+        "dovish": 4.0,
+        "dovish fed": 4.5,
+        "inflation falls": 3.5,
+        "inflation fell": 3.5,
+        "cooler inflation": 3.5,
+        "cpi falls": 3.5,
+        "cpi fell": 3.5,
+        "stimulus": 3.0,
+        "liquidity": 2.5,
+        "easing": 3.0
+    }
+
+    positive_score = 0.0
+    negative_score = 0.0
+    matched_positive = []
+    matched_negative = []
+
+    for phrase, weight in strong_positive.items():
+        if phrase in text:
+            positive_score += weight
+            matched_positive.append(phrase)
+
+    for phrase, weight in strong_negative.items():
+        if phrase in text:
+            negative_score += weight
+            matched_negative.append(phrase)
+
+    for phrase, weight in macro_positive.items():
+        if phrase in text:
+            positive_score += weight
+            matched_positive.append(phrase)
+
+    for phrase, weight in macro_negative.items():
+        if phrase in text:
+            negative_score += weight
+            matched_negative.append(phrase)
+
+    # ========================================================
+    # KONTEKSTLI QO'SHIMCHA QOIDALAR
+    # ========================================================
+
+    if (
+        "financial infrastructure" in text
+        or "infrastructure" in text
+    ):
+        positive_score += 1.5
+
+    if (
+        "boost" in text
+        and (
+            "stablecoin" in text
+            or "adoption" in text
+            or "investment" in text
+        )
+    ):
+        positive_score += 1.5
+
+    if (
+        "test network" in text
+        or "testnet" in text
+    ):
+        positive_score += 0.8
+
+    if (
+        "privacy" in text
+        and (
+            "upgrade" in text
+            or "improve" in text
+            or "without changing" in text
+        )
+    ):
+        positive_score += 1.0
+
+    # Qarama-qarshi signal bo'lsa neytrallikni oshiramiz.
+    conflict = (
+        positive_score > 0
+        and negative_score > 0
+    )
+
+    total_score = (
+        positive_score
+        + negative_score
+    )
+
+    if total_score <= 0:
+        up_pct = 33.33
+        down_pct = 33.33
+        neutral_pct = 33.34
+        impact = "PAST"
+        direction = "NEUTRAL"
+
+    else:
+        # Yangilikning yo'nalish kuchini hisoblash.
+        directional_strength = abs(
+            positive_score
+            - negative_score
+        )
+
+        if conflict:
+            neutral_base = 28.0
+        else:
+            neutral_base = 18.0
+
+        if directional_strength <= 1.0:
+            neutral_base = max(
+                neutral_base,
+                40.0
+            )
+
+        elif directional_strength <= 2.0:
+            neutral_base = max(
+                neutral_base,
+                30.0
+            )
+
+        neutral_pct = clamp(
+            neutral_base
+            + (
+                10.0
+                if total_score < 3.0
+                else 0.0
+            ),
+            15.0,
+            60.0
+        )
+
+        directional_total = max(
+            100.0 - neutral_pct,
+            1.0
+        )
+
+        if positive_score > negative_score:
+            up_pct = (
+                directional_total
+                * positive_score
+                / max(
+                    positive_score
+                    + negative_score,
+                    1e-12
+                )
+            )
+
+            down_pct = (
+                directional_total
+                - up_pct
+            )
+
+            direction = "UP"
+
+        elif negative_score > positive_score:
+            down_pct = (
+                directional_total
+                * negative_score
+                / max(
+                    positive_score
+                    + negative_score,
+                    1e-12
+                )
+            )
+
+            up_pct = (
+                directional_total
+                - down_pct
+            )
+
+            direction = "DOWN"
+
+        else:
+            up_pct = directional_total / 2.0
+            down_pct = directional_total / 2.0
+            direction = "NEUTRAL"
+
+        # Ta'sir kuchi faqat yo'nalishdan emas,
+        # yangilikning umumiy kuchidan ham olinadi.
+        if total_score >= 8.0:
+            impact = "YUQORI"
+
+        elif total_score >= 4.0:
+            impact = "O'RTACHA"
+
+        elif total_score >= 1.5:
+            impact = "PAST"
+
+        else:
+            impact = "JUDA PAST"
+
+    # ========================================================
+    # FOIZLARNI ANIQLIK BILAN 100% GA TENG QILISH
+    # ========================================================
+
+    up_pct = round(
+        clamp(up_pct, 0.0, 100.0),
+        2
+    )
+
+    down_pct = round(
+        clamp(down_pct, 0.0, 100.0),
+        2
+    )
+
+    neutral_pct = round(
+        clamp(neutral_pct, 0.0, 100.0),
+        2
+    )
+
+    difference = round(
+        100.0
+        - (
+            up_pct
+            + down_pct
+            + neutral_pct
+        ),
+        2
+    )
+
+    neutral_pct = round(
+        clamp(
+            neutral_pct + difference,
+            0.0,
+            100.0
+        ),
+        2
+    )
+
+    # ========================================================
+    # QISQA O'ZBEKCHA XULOSA
+    # ========================================================
+
+    if direction == "UP":
+        if impact == "YUQORI":
+            summary = (
+                "Yangilik kripto bozori uchun ijobiy signal "
+                "bermoqda va yuqoriga yo'nalishga ta'siri kuchli."
+            )
+
+        elif impact == "O'RTACHA":
+            summary = (
+                "Yangilik bozor uchun ijobiy bo'lib, "
+                "yuqoriga yo'nalishni qo'llab-quvvatlashi mumkin."
+            )
+
+        else:
+            summary = (
+                "Yangilikda ijobiy omil bor, "
+                "ammo bozor ta'siri cheklangan."
+            )
+
+    elif direction == "DOWN":
+        if impact == "YUQORI":
+            summary = (
+                "Yangilik kripto bozori uchun salbiy signal "
+                "bermoqda va pastga yo'nalishga ta'siri kuchli."
+            )
+
+        elif impact == "O'RTACHA":
+            summary = (
+                "Yangilik bozor uchun salbiy bo'lib, "
+                "pastga yo'nalishni kuchaytirishi mumkin."
+            )
+
+        else:
+            summary = (
+                "Yangilikda salbiy omil bor, "
+                "ammo bozor ta'siri cheklangan."
+            )
+
+    else:
+        summary = (
+            "Yangilikning ijobiy va salbiy tomonlari "
+            "bir-biriga yaqin yoki bozor yo'nalishi aniq emas."
+        )
+
+    result = {
+        "summary": summary,
+        "up_pct": up_pct,
+        "down_pct": down_pct,
+        "neutral_pct": neutral_pct,
+        "impact": impact,
+        "direction": direction,
+        "positive_score": round(
+            positive_score,
+            2
+        ),
+        "negative_score": round(
+            negative_score,
+            2
+        ),
+        "matched_positive": matched_positive,
+        "matched_negative": matched_negative
+    }
+
+    with NEWS_ANALYSIS_LOCK:
+        NEWS_ANALYSIS_CACHE[
+            cache_key
+        ] = result
+
+        if len(NEWS_ANALYSIS_CACHE) > 1000:
+            first_key = next(
+                iter(
+                    NEWS_ANALYSIS_CACHE
+                )
+            )
+
+            NEWS_ANALYSIS_CACHE.pop(
+                first_key,
+                None
+            )
+
+    return result
+
+
+def analyze_news_item(item):
+    """
+    NewsItem ichidagi original inglizcha sarlavhani
+    tahlil qilib, O'zbekcha xulosa va foizlarni qaytaradi.
+    """
+
+    original = (
+        item.original_title
+        or item.title
+    )
+
+    analysis = calculate_news_impact(
+        original
+    )
+
+    return {
+        "item": item,
+        "analysis": analysis
+    }
+
+
+def analyze_news_list(news):
+    result = []
+
+    for item in news or []:
+        try:
+            result.append(
+                analyze_news_item(item)
+            )
+        except Exception as exc:
+            log.warning(
+                "News analysis xatosi: %s",
+                exc
+            )
+
+    return result
+
+
 def parse_rss(url):
     response = requests.get(
         url,
@@ -2485,7 +3024,8 @@ def parse_rss(url):
                         title=title,
                         link=link,
                         published=published,
-                        source="RSS"
+                        source="RSS",
+                        original_title=title
                     )
                 )
 
@@ -2508,7 +3048,8 @@ def refresh_news():
 
             if key:
                 # =================================================
-                # QO'SHIMCHA: INGLIZCHA NEWS -> O'ZBEKCHA
+                # INGLIZCHA NEWS -> O'ZBEKCHA
+                # ORIGINAL ENGLISH TITLE HAM SAQLANADI
                 # =================================================
 
                 translated_title = (
@@ -2521,7 +3062,8 @@ def refresh_news():
                     title=translated_title,
                     link=item.link,
                     published=item.published,
-                    source=item.source
+                    source=item.source,
+                    original_title=item.original_title
                 )
 
         NEWS_CACHE = list(
@@ -2572,8 +3114,15 @@ def relevant_news(symbol):
             item.title.upper()
         )
 
+        original_upper = (
+            item.original_title.upper()
+            if item.original_title
+            else ""
+        )
+
         if any(
             keyword in title_upper
+            or keyword in original_upper
             for keyword in keywords
         ):
             result.append(item)
@@ -3004,52 +3553,30 @@ def build_report(
             {}
         )
 
+        lines.append("")
+
+        # ====================================================
+        # YUQORIGA BORISH EHTIMOLI
+        # ====================================================
+
         lines.append(
-            "🎯 PASTGA BORISH EHTIMOLI:"
+            "🎯 YUQORIGA BORISH EHTIMOLI:"
         )
-
-        for target in (
-            -1,
-            -3,
-            -5,
-            -10,
-            -15
-        ):
-            item = targets.get(
-                target,
-                {}
-            )
-
-            lines.append(
-                f"{target}%: "
-                f"{item.get('pct', 0):.2f}%"
-            )
-
-        # ====================================================
-        # QO'SHIMCHA: +1%, +2%, +3%, +4% STATISTIKA
-        # ====================================================
 
         profit_targets = stats.get(
             "profit_targets",
             {}
         )
 
-        loss_targets = stats.get(
-            "loss_targets",
-            {}
-        )
-
-        lines.append("")
-
-        lines.append(
-            "🎯 TARIXDA FOYDA YETISH STATISTIKASI:"
-        )
-
         for target in (
             1,
-            2,
             3,
-            4
+            5,
+            10,
+            15,
+            20,
+            30,
+            50
         ):
             item = profit_targets.get(
                 target,
@@ -3065,15 +3592,28 @@ def build_report(
 
         lines.append("")
 
+        # ====================================================
+        # PASTGA BORISH EHTIMOLI
+        # ====================================================
+
         lines.append(
-            "📉 TARIXDA PASTGA YETISH STATISTIKASI:"
+            "🎯 PASTGA BORISH EHTIMOLI:"
+        )
+
+        loss_targets = stats.get(
+            "loss_targets",
+            {}
         )
 
         for target in (
             1,
-            2,
             3,
-            4
+            5,
+            10,
+            15,
+            20,
+            30,
+            50
         ):
             item = loss_targets.get(
                 target,
@@ -3198,16 +3738,54 @@ def build_report(
             "📰 YANGILIK / EVENT:"
         )
 
-        for item in news[:5]:
+        news_analyses = analyze_news_list(
+            news[:5]
+        )
+
+        for news_data in news_analyses:
+            item = news_data["item"]
+            analysis = news_data["analysis"]
+
             lines.append(
                 f"• {item.title}"
             )
 
-    lines.append("")
+            lines.append(
+                f"  🇺🇿 Xulosa: "
+                f"{analysis.get('summary', '')}"
+            )
+
+            lines.append(
+                f"  📈 Yuqoriga: "
+                f"{analysis.get('up_pct', 0):.2f}%"
+            )
+
+            lines.append(
+                f"  📉 Pastga: "
+                f"{analysis.get('down_pct', 0):.2f}%"
+            )
+
+            lines.append(
+                f"  ➖ Neytral: "
+                f"{analysis.get('neutral_pct', 0):.2f}%"
+            )
+
+            lines.append(
+                f"  ⚡ Ta'sir kuchi: "
+                f"{analysis.get('impact', 'PAST')}"
+            )
+
+            lines.append("")
 
     lines.append(
         "⚠️ Eslatma: tarixiy analoglar "
         "kelajakdagi natijani kafolatlamaydi."
+    )
+
+    lines.append(
+        "Yangilik foizlari sarlavhadagi "
+        "bozor signallarining heuristik tahlilidir; "
+        "kelajakdagi narx harakatiga kafolat bermaydi."
     )
 
     lines.append(
@@ -3443,7 +4021,6 @@ def analyze_symbol(
                                         "FLAT"
                                     )
                                 )
-                            )
 
                             telegram_send_photo(
                                 chart_path,
@@ -3894,6 +4471,7 @@ def startup_message():
         f"🚦 Signal Gate\n"
         f"🌐 Market Scanner\n"
         f"📰 Yangiliklar/Event\n"
+        f"🧠 News Impact Analysis\n"
         f"📈 Grafik\n\n"
         f"Binance WebSocket faol.\n"
         f"Avtomatik order ochilmaydi."
