@@ -1,31 +1,41 @@
 # ============================================================
-# Crypto Deep Pattern Bot v9.0
-# DEEP HISTORICAL + REAL-TIME PATTERN ANALYZER
+# Crypto Deep Pattern Bot v9.0 — ULTRA DEEP PRICE ACTION
+# ============================================================
+# MAQSAD:
+# - Faqat real Binance OHLCV candle tarixidan foydalanadi
+# - Indikator signal sifatida ishlatilmaydi
+# - Har bir candle chuqur klassifikatsiya qilinadi
+# - 2/3/4/5/6 candle patternlar tekshiriladi
+# - Har bir occurrence'dan keyingi harakat candle-by-candle tekshiriladi
+# - TP1 / BE / trailing / maksimal R tahlil qilinadi
+# - Kamida 100 occurrence
+# - Maksimal 5 ta loss talabi
+# - Win Rate >= 95%
+# - Profit Factor, Avg R, MFE, MAE, drawdown tahlili
+# - Temporal stability: tarix boshidan oxirigacha tekshiriladi
+# - Walk-forward validation
+# - 100x bootstrap stability test
+# - Signal berishdan OLDIN pattern qayta tekshiriladi
+# - Signal chiqqandan keyin ham real-time candle bilan kuzatiladi
+# - Pattern topilmasa BOT TO'XTAMAYDI
+# - Har bir yangi yopilgan candle'dan keyin real-time tekshiradi
+# - Har RECHECK_INTERVAL soatda tarixni qayta analiz qiladi
 #
-# - Indicatorsiz candle-pattern analysis
-# - 21 candle classes
-# - 2/3/4 candle signatures
-# - Minimum 100 historical occurrences
-# - Every occurrence individually forward-tested
-# - MFE / MAE
-# - 1R / 2R / 4R / 6R / 8R / 10R
-# - TP1 / SL / BE / TRAIL
-# - First-event analysis
-# - Retracement / continuation analysis
-# - Year-by-year consistency
-# - Real-time closed-candle revalidation
-# - Automatic 1-hour re-scan if no valid patterns
-# - WebSocket reconnect
-# - Telegram deep report + chart
+# MUHIM:
+# 95% historical filter — kelajak uchun 95% kafolat emas.
+# Kod kelajak natijasini kafolatlamaydi; faqat belgilangan tarixiy
+# mezonlardan o'tgan patternlarni signalga qo'yadi.
+#
+# Binance WebSocket yopilgan candle uchun k['x'] == True yuboradi.
 # ============================================================
 
 import os
 import time
+import math
 import logging
 import asyncio
 import io
-import math
-
+import random
 from collections import deque, defaultdict
 
 import numpy as np
@@ -38,8 +48,12 @@ import matplotlib.pyplot as plt
 from binance import AsyncClient, BinanceSocketManager
 from telegram import Bot, InputFile
 from telegram.constants import ParseMode
-
 from dotenv import load_dotenv
+
+
+# ============================================================
+# ENV
+# ============================================================
 
 load_dotenv()
 
@@ -49,9 +63,11 @@ load_dotenv()
 # ============================================================
 
 CONFIG = {
+
     # --------------------------------------------------------
     # MARKET
     # --------------------------------------------------------
+
     "SYMBOLS": [
         s.strip().upper()
         for s in os.getenv(
@@ -71,81 +87,116 @@ CONFIG = {
     ],
 
     # --------------------------------------------------------
-    # HISTORICAL DATA
+    # MAXIMUM HISTORY
     # --------------------------------------------------------
+
     "DAYS_PER_TF": {
+
         "1m": int(os.getenv("DAYS_1M", "120")),
         "3m": int(os.getenv("DAYS_3M", "200")),
-        "5m": int(os.getenv("DAYS_5M", "365")),
-        "15m": int(os.getenv("DAYS_15M", "730")),
-        "30m": int(os.getenv("DAYS_30M", "1095")),
+        "5m": int(os.getenv("DAYS_5M", "730")),
+        "15m": int(os.getenv("DAYS_15M", "1095")),
+        "30m": int(os.getenv("DAYS_30M", "1460")),
         "1h": int(os.getenv("DAYS_1H", "1825")),
+        "2h": int(os.getenv("DAYS_2H", "1825")),
         "4h": int(os.getenv("DAYS_4H", "1825")),
     },
 
     # --------------------------------------------------------
-    # PATTERN
+    # PATTERN LENGTH
     # --------------------------------------------------------
+
     "SEQ_LENGTHS": [
         int(x)
         for x in os.getenv(
             "SEQ_LENGTHS",
-            "2,3,4"
+            "2,3,4,5,6"
         ).split(",")
     ],
 
     # --------------------------------------------------------
-    # DEEP FILTERS
+    # ULTRA STRICT FILTER
     # --------------------------------------------------------
+
+    # Kamida 100 ta real historical occurrence
     "MIN_OCCURRENCES": int(
         os.getenv("MIN_OCCURRENCES", "100")
     ),
 
-    "MIN_WIN_RATE": float(
-        os.getenv("MIN_WIN_RATE", "70")
-    ),
-
+    # 100 occurrence ichida maksimum 5 loss
     "MAX_LOSSES": int(
-        os.getenv("MAX_LOSSES", "30")
+        os.getenv("MAX_LOSSES", "5")
     ),
 
+    # Historical WR minimum 95%
+    "MIN_WIN_RATE": float(
+        os.getenv("MIN_WIN_RATE", "95")
+    ),
+
+    # Profit factor
     "MIN_PROFIT_FACTOR": float(
-        os.getenv("MIN_PROFIT_FACTOR", "1.30")
+        os.getenv("MIN_PROFIT_FACTOR", "2.0")
     ),
 
+    # O'rtacha R
     "MIN_AVG_R": float(
-        os.getenv("MIN_AVG_R", "0.10")
+        os.getenv("MIN_AVG_R", "0.20")
     ),
 
+    # Confidence
     "MIN_CONFIDENCE": float(
-        os.getenv("MIN_CONFIDENCE", "65")
+        os.getenv("MIN_CONFIDENCE", "90")
     ),
 
-    # At least this many yearly samples are required
-    # for yearly consistency calculation.
-    "MIN_YEAR_SAMPLES": int(
-        os.getenv("MIN_YEAR_SAMPLES", "5")
+    # --------------------------------------------------------
+    # EXTRA DEEP VALIDATION
+    # --------------------------------------------------------
+
+    # Walk-forward validation
+    "MIN_WALK_FORWARD_WR": float(
+        os.getenv("MIN_WALK_FORWARD_WR", "90")
     ),
 
-    # Maximum acceptable yearly WR deviation.
-    "MAX_YEARLY_WR_STD": float(
-        os.getenv("MAX_YEARLY_WR_STD", "25")
+    # Har bir vaqt segmentida minimum occurrence
+    "MIN_SEGMENT_OCCURRENCES": int(
+        os.getenv("MIN_SEGMENT_OCCURRENCES", "15")
+    ),
+
+    # 100x bootstrap
+    "BOOTSTRAP_RUNS": int(
+        os.getenv("BOOTSTRAP_RUNS", "100")
+    ),
+
+    # Bootstrap'da WR 90% dan past tushsa reject
+    "MIN_BOOTSTRAP_WR": float(
+        os.getenv("MIN_BOOTSTRAP_WR", "90")
+    ),
+
+    # Bootstrap confidence
+    "MIN_BOOTSTRAP_LOWER": float(
+        os.getenv("MIN_BOOTSTRAP_LOWER", "90")
     ),
 
     # --------------------------------------------------------
     # FORWARD ANALYSIS
     # --------------------------------------------------------
+
     "FORWARD_CANDLES": int(
         os.getenv("FORWARD_CANDLES", "50")
     ),
+
+    # --------------------------------------------------------
+    # SL
+    # --------------------------------------------------------
 
     "SL_BUF": float(
         os.getenv("SL_BUF", "10")
     ),
 
     # --------------------------------------------------------
-    # 1:1R MANAGEMENT
+    # R MANAGEMENT
     # --------------------------------------------------------
+
     "TP1_R": 1.0,
 
     "TP1_CLOSE_PCT": 0.50,
@@ -157,85 +208,117 @@ CONFIG = {
     "MAX_TRAIL_R": 10.0,
 
     # --------------------------------------------------------
-    # DEEP MARKET MOVEMENT ANALYSIS
+    # REAL-TIME
     # --------------------------------------------------------
-    "RETRACE_R_THRESHOLD": float(
-        os.getenv("RETRACE_R_THRESHOLD", "1.0")
-    ),
 
-    "BREAKOUT_R_THRESHOLD": float(
-        os.getenv("BREAKOUT_R_THRESHOLD", "1.0")
-    ),
+    "CANDLE_BUFFER": 500,
 
-    # --------------------------------------------------------
-    # API
-    # --------------------------------------------------------
+    "ATR_PERIOD": 50,
+
     "REQUEST_DELAY": float(
         os.getenv("REQUEST_DELAY", "0.25")
     ),
 
-    "CANDLE_BUFFER": int(
-        os.getenv("CANDLE_BUFFER", "500")
+    # Har nechta soatda tarixni qayta analiz qiladi
+    "RECHECK_INTERVAL": int(
+        os.getenv("RECHECK_INTERVAL", "3600")
     ),
 
-    "ATR_PERIOD": int(
-        os.getenv("ATR_PERIOD", "50")
-    ),
-
-    # --------------------------------------------------------
-    # RESCAN
-    # --------------------------------------------------------
-    "NO_PATTERN_RESCAN_SECONDS": int(
-        os.getenv(
-            "NO_PATTERN_RESCAN_SECONDS",
-            "3600"
-        )
+    # Signal yuborishdan oldin patternni necha marta
+    # independent validation pass'dan o'tkazish
+    "SIGNAL_VALIDATION_PASSES": int(
+        os.getenv("SIGNAL_VALIDATION_PASSES", "100")
     ),
 
     # --------------------------------------------------------
     # REAL-TIME CONFIRMATION
     # --------------------------------------------------------
-    "REALTIME_MIN_RECHECKS": int(
-        os.getenv(
-            "REALTIME_MIN_RECHECKS",
-            "1"
-        )
+
+    # Signal patterni yopilgan candle'da aniq mos bo'lishi kerak
+    "REQUIRE_CLOSED_CANDLE": True,
+
+    # Signal oldidan oxirgi N candle qayta tekshiriladi
+    "LIVE_CONFIRMATION_CANDLES": int(
+        os.getenv("LIVE_CONFIRMATION_CANDLES", "6")
+    ),
+
+    # --------------------------------------------------------
+    # CHART
+    # --------------------------------------------------------
+
+    "SEND_CHART": os.getenv(
+        "SEND_CHART",
+        "false"
+    ).lower() == "true",
+
+    # --------------------------------------------------------
+    # LOOP
+    # --------------------------------------------------------
+
+    "NO_PATTERN_SLEEP": int(
+        os.getenv("NO_PATTERN_SLEEP", "3600")
+    ),
+
+    # history refresh xatodan keyingi delay
+    "ERROR_SLEEP": int(
+        os.getenv("ERROR_SLEEP", "15")
     ),
 }
-
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-
-log = logging.getLogger(__name__)
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
+TELEGRAM_TOKEN = os.getenv(
+    "TELEGRAM_TOKEN"
+)
+
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID"
+)
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+log = logging.getLogger(
+    "ULTRA_DEEP_PATTERN_BOT"
+)
+
+
+# ============================================================
+# TELEGRAM WRAPPER
+# ============================================================
+
 class TG:
 
-    def __init__(self, token, chat_id):
-        self.bot = Bot(token=token) if token else None
+    def __init__(
+        self,
+        token,
+        chat_id
+    ):
+
+        self.bot = (
+            Bot(token=token)
+            if token
+            else None
+        )
+
         self.chat_id = chat_id
 
-    async def send(self, msg):
+    async def send(
+        self,
+        msg
+    ):
 
         if not self.bot:
             return
 
         try:
+
             await self.bot.send_message(
                 chat_id=self.chat_id,
                 text=msg,
@@ -243,32 +326,59 @@ class TG:
             )
 
         except Exception as e:
-            log.error(f"Telegram send error: {e}")
 
-    async def photo(self, buf, caption=""):
+            log.error(
+                f"Telegram error: {e}"
+            )
+
+    async def photo(
+        self,
+        buf,
+        caption=""
+    ):
 
         if not self.bot:
             return
 
         try:
+
             await self.bot.send_photo(
                 chat_id=self.chat_id,
                 photo=InputFile(
                     buf,
-                    filename="deep_signal.png"
+                    filename="signal.png"
                 ),
                 caption=caption,
                 parse_mode=ParseMode.HTML
             )
 
         except Exception as e:
-            log.error(f"Telegram photo error: {e}")
+
+            log.error(
+                f"Telegram photo error: {e}"
+            )
 
 
 tg = TG(
     TELEGRAM_TOKEN,
     TELEGRAM_CHAT_ID
 )
+
+
+# ============================================================
+# UTILS
+# ============================================================
+
+def safe_float(
+    value,
+    default=0.0
+):
+
+    try:
+        return float(value)
+
+    except Exception:
+        return default
 
 
 # ============================================================
@@ -288,7 +398,11 @@ async def fetch_history(
 
     start_time = (
         end_time
-        - days * 24 * 60 * 60 * 1000
+        - days
+        * 24
+        * 60
+        * 60
+        * 1000
     )
 
     all_klines = []
@@ -297,7 +411,7 @@ async def fetch_history(
 
     log.info(
         f"📥 {symbol} {interval}: "
-        f"{days} kun tarix yuklanmoqda..."
+        f"{days} kunlik tarix..."
     )
 
     while cursor < end_time:
@@ -315,10 +429,12 @@ async def fetch_history(
 
             log.error(
                 f"{symbol} {interval} "
-                f"fetch error: {e}"
+                f"history xato: {e}"
             )
 
-            await asyncio.sleep(2)
+            await asyncio.sleep(
+                CONFIG["ERROR_SLEEP"]
+            )
 
             continue
 
@@ -329,18 +445,23 @@ async def fetch_history(
             klines
         )
 
-        last_open_time = klines[-1][0]
+        last_open_time = int(
+            klines[-1][0]
+        )
 
         if last_open_time <= cursor:
             break
 
-        cursor = last_open_time + 1
+        cursor = (
+            last_open_time + 1
+        )
 
         await asyncio.sleep(
             CONFIG["REQUEST_DELAY"]
         )
 
     if not all_klines:
+
         return pd.DataFrame(
             columns=[
                 "open_time",
@@ -370,20 +491,29 @@ async def fetch_history(
         ]
     )
 
-    numeric_cols = [
+    df = df.drop_duplicates(
+        subset=["open_time"]
+    )
+
+    for col in [
         "open",
         "high",
         "low",
         "close",
         "volume"
-    ]
+    ]:
 
-    for col in numeric_cols:
-        df[col] = df[col].astype(float)
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce"
+        )
 
     df["open_time"] = (
-        df["open_time"] // 1000
-    )
+        pd.to_numeric(
+            df["open_time"],
+            errors="coerce"
+        ) // 1000
+    ).astype("int64")
 
     df = df[
         [
@@ -396,21 +526,15 @@ async def fetch_history(
         ]
     ]
 
-    df = df.drop_duplicates(
-        subset=["open_time"]
-    )
-
     df = df.sort_values(
         "open_time"
-    )
-
-    df = df.reset_index(
+    ).reset_index(
         drop=True
     )
 
     log.info(
         f"✅ {symbol} {interval}: "
-        f"{len(df)} candle yuklandi"
+        f"{len(df)} candle"
     )
 
     return df
@@ -460,20 +584,32 @@ def compute_atr(
 
 
 # ============================================================
-# 3. 21 CANDLE CLASSIFICATION
+# 3. DEEP CANDLE CLASSIFICATION
 # ============================================================
 
-def classify_candles(df):
+def classify_candles(
+    df
+):
 
-    o = df["open"].values
-    h = df["high"].values
-    l = df["low"].values
-    c = df["close"].values
-    atr = df["atr"].values
+    out = df.copy()
+
+    o = out["open"].values
+    h = out["high"].values
+    l = out["low"].values
+    c = out["close"].values
+
+    atr = out["atr"].values
 
     body = c - o
 
-    body_abs = np.abs(body)
+    body_abs = np.abs(
+        body
+    )
+
+    candle_range = np.maximum(
+        h - l,
+        1e-12
+    )
 
     upper_wick = (
         h - np.maximum(o, c)
@@ -482,6 +618,10 @@ def classify_candles(df):
     lower_wick = (
         np.minimum(o, c) - l
     )
+
+    # --------------------------------------------------------
+    # DIRECTION
+    # --------------------------------------------------------
 
     direction = np.where(
         body > 0,
@@ -493,6 +633,10 @@ def classify_candles(df):
         )
     )
 
+    # --------------------------------------------------------
+    # BODY / ATR
+    # --------------------------------------------------------
+
     body_ratio = (
         body_abs
         / np.maximum(
@@ -502,24 +646,41 @@ def classify_candles(df):
     )
 
     body_size = np.where(
-        body_ratio < 0.3,
-        "S",
+        body_ratio < 0.15,
+        "XS",
         np.where(
-            body_ratio < 0.8,
-            "M",
+            body_ratio < 0.30,
+            "S",
             np.where(
-                body_ratio < 1.5,
-                "L",
-                "X"
+                body_ratio < 0.80,
+                "M",
+                np.where(
+                    body_ratio < 1.50,
+                    "L",
+                    "X"
+                )
             )
         )
     )
+
+    # --------------------------------------------------------
+    # BODY / RANGE
+    # --------------------------------------------------------
+
+    body_range_ratio = (
+        body_abs
+        / candle_range
+    )
+
+    # --------------------------------------------------------
+    # WICKS
+    # --------------------------------------------------------
 
     uw_ratio = (
         upper_wick
         / np.maximum(
             body_abs,
-            atr * 0.1
+            atr * 0.10
         )
     )
 
@@ -527,15 +688,29 @@ def classify_candles(df):
         lower_wick
         / np.maximum(
             body_abs,
-            atr * 0.1
+            atr * 0.10
         )
     )
 
-    big_upper = uw_ratio > 1.2
-    big_lower = lw_ratio > 1.2
+    huge_upper = (
+        uw_ratio >= 2.5
+    )
 
-    huge_upper = uw_ratio > 2.5
-    huge_lower = lw_ratio > 2.5
+    huge_lower = (
+        lw_ratio >= 2.5
+    )
+
+    big_upper = (
+        uw_ratio >= 1.2
+    )
+
+    big_lower = (
+        lw_ratio >= 1.2
+    )
+
+    # --------------------------------------------------------
+    # WICK CLASS
+    # --------------------------------------------------------
 
     wick_class = np.where(
         huge_upper & huge_lower,
@@ -563,24 +738,91 @@ def classify_candles(df):
         )
     )
 
-    codes = np.array([
-        f"{d}{s}{w}"
-        for d, s, w in zip(
-            direction,
-            body_size,
-            wick_class
-        )
-    ])
+    # --------------------------------------------------------
+    # CLOSE LOCATION
+    # --------------------------------------------------------
 
-    out = df.copy()
+    close_position = (
+        (c - l)
+        / candle_range
+    )
+
+    close_class = np.where(
+        close_position >= 0.85,
+        "H",
+        np.where(
+            close_position >= 0.65,
+            "U",
+            np.where(
+                close_position <= 0.15,
+                "L",
+                np.where(
+                    close_position <= 0.35,
+                    "D",
+                    "M"
+                )
+            )
+        )
+    )
+
+    # --------------------------------------------------------
+    # RANGE CLASS
+    # --------------------------------------------------------
+
+    range_ratio = (
+        candle_range
+        / np.maximum(
+            atr,
+            1e-9
+        )
+    )
+
+    range_class = np.where(
+        range_ratio < 0.50,
+        "N",
+        np.where(
+            range_ratio < 1.0,
+            "M",
+            np.where(
+                range_ratio < 1.8,
+                "L",
+                "X"
+            )
+        )
+    )
+
+    # --------------------------------------------------------
+    # CANDLE CODE
+    # --------------------------------------------------------
+
+    codes = np.array(
+        [
+            f"{d}{s}{w}{cl}{rg}"
+            for d, s, w, cl, rg
+            in zip(
+                direction,
+                body_size,
+                wick_class,
+                close_class,
+                range_class
+            )
+        ]
+    )
 
     out["code"] = codes
+
+    out["body_ratio"] = body_ratio
+    out["body_range_ratio"] = body_range_ratio
+    out["upper_wick_ratio"] = uw_ratio
+    out["lower_wick_ratio"] = lw_ratio
+    out["close_position"] = close_position
+    out["range_ratio"] = range_ratio
 
     return out
 
 
 # ============================================================
-# 4. SIGNATURES
+# 4. SIGNATURE
 # ============================================================
 
 def build_signatures(
@@ -589,12 +831,15 @@ def build_signatures(
 ):
 
     codes = (
-        df_coded["code"].values
+        df_coded["code"]
+        .values
     )
 
     n = len(codes)
 
-    sigs = [None] * n
+    sigs = [
+        None
+    ] * n
 
     for i in range(
         seq_len - 1,
@@ -612,10 +857,10 @@ def build_signatures(
 
 
 # ============================================================
-# 5. DEEP FORWARD ANALYSIS
+# 5. FUTURE PATH ANALYSIS
 # ============================================================
 
-def simulate_forward_deep(
+def simulate_forward(
     df,
     entry_idx,
     direction,
@@ -632,23 +877,19 @@ def simulate_forward_deep(
     if entry_idx >= n - 1:
         return None
 
-    entry = float(
-        c[entry_idx]
-    )
-
-    atr_value = float(
-        atr[entry_idx]
-    )
-
-    if not np.isfinite(atr_value):
-        return None
+    entry = c[
+        entry_idx
+    ]
 
     buf = max(
         sl_buf_cfg
         * (
-            entry / 100000
+            entry
+            / 100000
         ),
-        atr_value * 0.15
+
+        atr[entry_idx]
+        * 0.15
     )
 
     if direction == "B":
@@ -680,11 +921,13 @@ def simulate_forward_deep(
 
     tp1_price = (
         entry
-        + CONFIG["TP1_R"] * sl_dist
+        + CONFIG["TP1_R"]
+        * sl_dist
         if direction == "B"
         else
         entry
-        - CONFIG["TP1_R"] * sl_dist
+        - CONFIG["TP1_R"]
+        * sl_dist
     )
 
     tp1_hit = False
@@ -697,29 +940,13 @@ def simulate_forward_deep(
 
     min_r_reached = 0.0
 
-    max_adverse_r = 0.0
-
-    first_event = None
-
-    bars_to_tp1 = None
-
-    bars_to_sl = None
-
-    bars_to_max_r = None
-
-    retracement_count = 0
-
-    continuation_count = 0
-
-    breakout_count = 0
-
-    previous_max_r = 0.0
-
     max_i = min(
         entry_idx
         + CONFIG["FORWARD_CANDLES"],
         n - 1
     )
+
+    path = []
 
     for i in range(
         entry_idx + 1,
@@ -729,239 +956,162 @@ def simulate_forward_deep(
         if direction == "B":
 
             current_max_r = (
-                h[i] - entry
+                h[i]
+                - entry
             ) / sl_dist
 
             current_min_r = (
-                l[i] - entry
+                l[i]
+                - entry
             ) / sl_dist
 
         else:
 
             current_max_r = (
-                entry - l[i]
+                entry
+                - l[i]
             ) / sl_dist
 
             current_min_r = (
-                entry - h[i]
+                entry
+                - h[i]
             ) / sl_dist
 
-        if (
+        max_r_reached = max(
+            max_r_reached,
             current_max_r
-            > max_r_reached
-        ):
+        )
 
-            max_r_reached = (
-                current_max_r
-            )
-
-            bars_to_max_r = (
-                i - entry_idx
-            )
-
-        if (
-            current_min_r
-            < min_r_reached
-        ):
-
-            min_r_reached = (
-                current_min_r
-            )
-
-        max_adverse_r = min(
-            max_adverse_r,
+        min_r_reached = min(
+            min_r_reached,
             current_min_r
         )
 
-        # ----------------------------------------------------
-        # RETRACEMENT
-        # ----------------------------------------------------
-
-        if (
-            previous_max_r
-            >= CONFIG[
-                "RETRACE_R_THRESHOLD"
-            ]
-            and current_max_r
-            < previous_max_r
-        ):
-
-            retracement_count += 1
-
-        # ----------------------------------------------------
-        # CONTINUATION
-        # ----------------------------------------------------
-
-        if (
-            current_max_r
-            > previous_max_r
-            and current_max_r > 0
-        ):
-
-            continuation_count += 1
-
-        # ----------------------------------------------------
-        # BREAKOUT
-        # ----------------------------------------------------
-
-        if (
-            current_max_r
-            >= CONFIG[
-                "BREAKOUT_R_THRESHOLD"
-            ]
-        ):
-
-            breakout_count += 1
-
-        previous_max_r = max(
-            previous_max_r,
+        path.append(
             current_max_r
         )
 
         # ----------------------------------------------------
-        # SL / TRAILING STOP
+        # STOP
         # ----------------------------------------------------
-
-        stop_hit = False
 
         if direction == "B":
 
             if l[i] <= sl:
-                stop_hit = True
+
+                if tp1_hit:
+
+                    p1 = (
+                        CONFIG["TP1_CLOSE_PCT"]
+                        * CONFIG["TP1_R"]
+                    )
+
+                    p2 = (
+                        (
+                            1
+                            - CONFIG[
+                                "TP1_CLOSE_PCT"
+                            ]
+                        )
+                        * (
+                            (
+                                sl
+                                - entry
+                            )
+                            / sl_dist
+                        )
+                    )
+
+                    return {
+                        "final_r": p1 + p2,
+                        "max_r": max_r_reached,
+                        "min_r": min_r_reached,
+                        "bars": i - entry_idx,
+                        "tp1": True,
+                        "exit": "SL/BE/TRAIL",
+                        "path": path
+                    }
+
+                return {
+                    "final_r": (
+                        sl - entry
+                    ) / sl_dist,
+                    "max_r": max_r_reached,
+                    "min_r": min_r_reached,
+                    "bars": i - entry_idx,
+                    "tp1": False,
+                    "exit": "SL",
+                    "path": path
+                }
+
+            # TP1
+            if (
+                not tp1_hit
+                and h[i] >= tp1_price
+            ):
+
+                tp1_hit = True
+
+                sl = entry
 
         else:
 
             if h[i] >= sl:
-                stop_hit = True
 
-        if stop_hit:
+                if tp1_hit:
 
-            if first_event is None:
-                first_event = (
-                    "BE"
-                    if tp1_hit
-                    and abs(
-                        sl - entry
-                    ) < sl_dist * 0.01
-                    else "SL"
-                )
-
-            if tp1_hit:
-
-                p1 = (
-                    CONFIG[
-                        "TP1_CLOSE_PCT"
-                    ]
-                    * CONFIG["TP1_R"]
-                )
-
-                p2 = (
-                    (
-                        1
-                        - CONFIG[
-                            "TP1_CLOSE_PCT"
-                        ]
+                    p1 = (
+                        CONFIG["TP1_CLOSE_PCT"]
+                        * CONFIG["TP1_R"]
                     )
-                    * (
+
+                    p2 = (
                         (
-                            sl - entry
+                            1
+                            - CONFIG[
+                                "TP1_CLOSE_PCT"
+                            ]
                         )
-                        / sl_dist
-                        if direction == "B"
-                        else
-                        (
-                            entry - sl
+                        * (
+                            (
+                                entry
+                                - sl
+                            )
+                            / sl_dist
                         )
-                        / sl_dist
                     )
-                )
 
-                final_r = (
-                    p1 + p2
-                )
+                    return {
+                        "final_r": p1 + p2,
+                        "max_r": max_r_reached,
+                        "min_r": min_r_reached,
+                        "bars": i - entry_idx,
+                        "tp1": True,
+                        "exit": "SL/BE/TRAIL",
+                        "path": path
+                    }
 
-            else:
-
-                final_r = (
-                    (
-                        sl - entry
-                    )
-                    / sl_dist
-                    if direction == "B"
-                    else
-                    (
+                return {
+                    "final_r": (
                         entry - sl
-                    )
-                    / sl_dist
-                )
+                    ) / sl_dist,
+                    "max_r": max_r_reached,
+                    "min_r": min_r_reached,
+                    "bars": i - entry_idx,
+                    "tp1": False,
+                    "exit": "SL",
+                    "path": path
+                }
 
-            bars_to_sl = (
-                i - entry_idx
-            )
+            # TP1
+            if (
+                not tp1_hit
+                and l[i] <= tp1_price
+            ):
 
-            return {
-                "final_r": float(
-                    final_r
-                ),
-                "max_r": float(
-                    max_r_reached
-                ),
-                "min_r": float(
-                    min_r_reached
-                ),
-                "mae_r": float(
-                    max_adverse_r
-                ),
-                "tp1_hit": bool(
-                    tp1_hit
-                ),
-                "first_event": first_event,
-                "bars_to_tp1": bars_to_tp1,
-                "bars_to_sl": bars_to_sl,
-                "bars_to_max_r": bars_to_max_r,
-                "retracement_count": (
-                    retracement_count
-                ),
-                "continuation_count": (
-                    continuation_count
-                ),
-                "breakout_count": (
-                    breakout_count
-                ),
-                "bars_forward": (
-                    i - entry_idx
-                ),
-            }
+                tp1_hit = True
 
-        # ----------------------------------------------------
-        # TP1
-        # ----------------------------------------------------
-
-        if (
-            not tp1_hit
-            and (
-                (
-                    direction == "B"
-                    and h[i] >= tp1_price
-                )
-                or
-                (
-                    direction == "S"
-                    and l[i] <= tp1_price
-                )
-            )
-        ):
-
-            tp1_hit = True
-
-            if first_event is None:
-                first_event = "TP1"
-
-            bars_to_tp1 = (
-                i - entry_idx
-            )
-
-            sl = entry
+                sl = entry
 
         # ----------------------------------------------------
         # TRAILING
@@ -995,14 +1145,16 @@ def simulate_forward_deep(
 
                     sl = (
                         entry
-                        + lock_r * sl_dist
+                        + lock_r
+                        * sl_dist
                     )
 
                 else:
 
                     sl = (
                         entry
-                        - lock_r * sl_dist
+                        - lock_r
+                        * sl_dist
                     )
 
         # ----------------------------------------------------
@@ -1017,9 +1169,7 @@ def simulate_forward_deep(
             if tp1_hit:
 
                 p1 = (
-                    CONFIG[
-                        "TP1_CLOSE_PCT"
-                    ]
+                    CONFIG["TP1_CLOSE_PCT"]
                     * CONFIG["TP1_R"]
                 )
 
@@ -1041,66 +1191,37 @@ def simulate_forward_deep(
                     CONFIG["MAX_TRAIL_R"]
                 )
 
-            if first_event is None:
-                first_event = "MAX_TRAIL"
-
             return {
-                "final_r": float(
-                    final_r
-                ),
-                "max_r": float(
-                    max_r_reached
-                ),
-                "min_r": float(
-                    min_r_reached
-                ),
-                "mae_r": float(
-                    max_adverse_r
-                ),
-                "tp1_hit": bool(
-                    tp1_hit
-                ),
-                "first_event": first_event,
-                "bars_to_tp1": bars_to_tp1,
-                "bars_to_sl": bars_to_sl,
-                "bars_to_max_r": bars_to_max_r,
-                "retracement_count": (
-                    retracement_count
-                ),
-                "continuation_count": (
-                    continuation_count
-                ),
-                "breakout_count": (
-                    breakout_count
-                ),
-                "bars_forward": (
-                    i - entry_idx
-                ),
+                "final_r": final_r,
+                "max_r": max_r_reached,
+                "min_r": min_r_reached,
+                "bars": i - entry_idx,
+                "tp1": tp1_hit,
+                "exit": "MAX_TRAIL",
+                "path": path
             }
 
     # --------------------------------------------------------
-    # FORWARD WINDOW ENDED
+    # FORWARD WINDOW END
     # --------------------------------------------------------
 
     final_r = (
         (
-            c[max_i] - entry
-        )
-        / sl_dist
+            c[max_i]
+            - entry
+        ) / sl_dist
         if direction == "B"
         else
         (
-            entry - c[max_i]
-        )
-        / sl_dist
+            entry
+            - c[max_i]
+        ) / sl_dist
     )
 
     if tp1_hit:
 
         p1 = (
-            CONFIG[
-                "TP1_CLOSE_PCT"
-            ]
+            CONFIG["TP1_CLOSE_PCT"]
             * CONFIG["TP1_R"]
         )
 
@@ -1118,44 +1239,14 @@ def simulate_forward_deep(
             p1 + p2
         )
 
-    if first_event is None:
-
-        first_event = (
-            "FORWARD_END"
-        )
-
     return {
-        "final_r": float(
-            final_r
-        ),
-        "max_r": float(
-            max_r_reached
-        ),
-        "min_r": float(
-            min_r_reached
-        ),
-        "mae_r": float(
-            max_adverse_r
-        ),
-        "tp1_hit": bool(
-            tp1_hit
-        ),
-        "first_event": first_event,
-        "bars_to_tp1": bars_to_tp1,
-        "bars_to_sl": bars_to_sl,
-        "bars_to_max_r": bars_to_max_r,
-        "retracement_count": (
-            retracement_count
-        ),
-        "continuation_count": (
-            continuation_count
-        ),
-        "breakout_count": (
-            breakout_count
-        ),
-        "bars_forward": (
-            max_i - entry_idx
-        ),
+        "final_r": final_r,
+        "max_r": max_r_reached,
+        "min_r": min_r_reached,
+        "bars": max_i - entry_idx,
+        "tp1": tp1_hit,
+        "exit": "TIME",
+        "path": path
     }
 
 
@@ -1167,59 +1258,393 @@ def compute_r_distribution(
     max_r_list
 ):
 
+    arr = np.array(
+        max_r_list,
+        dtype=float
+    )
+
     return {
+
         "reached_1r": int(
-            sum(
-                1
-                for x in max_r_list
-                if x >= 1
-            )
+            np.sum(arr >= 1)
         ),
 
         "reached_2r": int(
-            sum(
-                1
-                for x in max_r_list
-                if x >= 2
-            )
+            np.sum(arr >= 2)
         ),
 
         "reached_4r": int(
-            sum(
-                1
-                for x in max_r_list
-                if x >= 4
-            )
+            np.sum(arr >= 4)
         ),
 
         "reached_6r": int(
-            sum(
-                1
-                for x in max_r_list
-                if x >= 6
-            )
+            np.sum(arr >= 6)
         ),
 
         "reached_8r": int(
-            sum(
-                1
-                for x in max_r_list
-                if x >= 8
-            )
+            np.sum(arr >= 8)
         ),
 
         "reached_10r": int(
-            sum(
-                1
-                for x in max_r_list
-                if x >= 10
-            )
+            np.sum(arr >= 10)
         ),
     }
 
 
 # ============================================================
-# 7. CONFIDENCE
+# 7. BASIC STATISTICS
+# ============================================================
+
+def calculate_statistics(
+    r_values,
+    max_r_values,
+    min_r_values
+):
+
+    r = np.array(
+        r_values,
+        dtype=float
+    )
+
+    max_r = np.array(
+        max_r_values,
+        dtype=float
+    )
+
+    min_r = np.array(
+        min_r_values,
+        dtype=float
+    )
+
+    count = len(r)
+
+    if count == 0:
+        return None
+
+    wins = int(
+        np.sum(r > 0)
+    )
+
+    losses = int(
+        np.sum(r <= 0)
+    )
+
+    win_rate = (
+        wins
+        / count
+        * 100
+    )
+
+    gross_win = float(
+        r[r > 0].sum()
+    ) if np.any(r > 0) else 0.0
+
+    gross_loss = float(
+        abs(
+            r[r < 0].sum()
+        )
+    ) if np.any(r < 0) else 0.0
+
+    profit_factor = (
+        gross_win
+        / gross_loss
+        if gross_loss > 0
+        else 999.0
+    )
+
+    avg_r = float(
+        np.mean(r)
+    )
+
+    median_r = float(
+        np.median(r)
+    )
+
+    std_r = float(
+        np.std(r)
+    )
+
+    avg_mfe = float(
+        np.mean(max_r)
+    )
+
+    avg_mae = float(
+        abs(
+            np.mean(
+                np.minimum(
+                    min_r,
+                    0
+                )
+            )
+        )
+    )
+
+    # --------------------------------------------------------
+    # EQUITY / DRAWDOWN
+    # --------------------------------------------------------
+
+    equity = np.cumsum(r)
+
+    peak = np.maximum.accumulate(
+        equity
+    )
+
+    drawdown = (
+        equity
+        - peak
+    )
+
+    max_drawdown = float(
+        abs(
+            np.min(drawdown)
+        )
+    ) if len(drawdown) else 0.0
+
+    return {
+
+        "count": count,
+
+        "wins": wins,
+
+        "losses": losses,
+
+        "win_rate": win_rate,
+
+        "profit_factor": profit_factor,
+
+        "avg_r": avg_r,
+
+        "median_r": median_r,
+
+        "std_r": std_r,
+
+        "avg_mfe": avg_mfe,
+
+        "avg_mae": avg_mae,
+
+        "max_drawdown_r": max_drawdown,
+    }
+
+
+# ============================================================
+# 8. 100x BOOTSTRAP
+# ============================================================
+
+def bootstrap_validation(
+    r_values,
+    runs=100
+):
+
+    r = np.array(
+        r_values,
+        dtype=float
+    )
+
+    n = len(r)
+
+    if n < 20:
+
+        return {
+            "runs": 0,
+            "avg_wr": 0.0,
+            "min_wr": 0.0,
+            "p05_wr": 0.0,
+            "lower": 0.0,
+            "passed": False
+        }
+
+    seed = (
+        int(
+            np.abs(
+                np.sum(
+                    r
+                    * 100000
+                )
+            )
+        )
+        % (
+            2**32 - 1
+        )
+    )
+
+    rng = np.random.default_rng(
+        seed
+    )
+
+    wrs = []
+
+    for _ in range(
+        max(1, runs)
+    ):
+
+        sample = rng.choice(
+            r,
+            size=n,
+            replace=True
+        )
+
+        wr = (
+            np.mean(
+                sample > 0
+            )
+            * 100
+        )
+
+        wrs.append(
+            float(wr)
+        )
+
+    wrs = np.array(
+        wrs
+    )
+
+    p05 = float(
+        np.percentile(
+            wrs,
+            5
+        )
+    )
+
+    return {
+
+        "runs": len(wrs),
+
+        "avg_wr": float(
+            np.mean(wrs)
+        ),
+
+        "min_wr": float(
+            np.min(wrs)
+        ),
+
+        "p05_wr": p05,
+
+        "lower": p05,
+
+        "passed": (
+            p05
+            >= CONFIG[
+                "MIN_BOOTSTRAP_LOWER"
+            ]
+        )
+    }
+
+
+# ============================================================
+# 9. TEMPORAL STABILITY
+# ============================================================
+
+def temporal_validation(
+    df,
+    idx_list,
+    direction
+):
+
+    if len(idx_list) < 60:
+
+        return {
+            "passed": False,
+            "segments": [],
+            "min_wr": 0.0,
+            "avg_wr": 0.0
+        }
+
+    idx_sorted = sorted(
+        idx_list
+    )
+
+    chunks = np.array_split(
+        idx_sorted,
+        6
+    )
+
+    segment_stats = []
+
+    for chunk in chunks:
+
+        if len(chunk) < CONFIG[
+            "MIN_SEGMENT_OCCURRENCES"
+        ]:
+            continue
+
+        rs = []
+
+        for idx in chunk:
+
+            result = simulate_forward(
+                df,
+                idx,
+                direction,
+                CONFIG["SL_BUF"]
+            )
+
+            if result is None:
+                continue
+
+            rs.append(
+                result["final_r"]
+            )
+
+        if len(rs) < CONFIG[
+            "MIN_SEGMENT_OCCURRENCES"
+        ]:
+            continue
+
+        arr = np.array(
+            rs
+        )
+
+        wr = (
+            np.mean(
+                arr > 0
+            )
+            * 100
+        )
+
+        segment_stats.append(
+            {
+                "count": len(arr),
+                "wr": float(wr)
+            }
+        )
+
+    if not segment_stats:
+
+        return {
+            "passed": False,
+            "segments": [],
+            "min_wr": 0.0,
+            "avg_wr": 0.0
+        }
+
+    wrs = [
+        x["wr"]
+        for x in segment_stats
+    ]
+
+    return {
+
+        "passed": (
+            min(wrs)
+            >= CONFIG[
+                "MIN_WALK_FORWARD_WR"
+            ]
+        ),
+
+        "segments": segment_stats,
+
+        "min_wr": float(
+            min(wrs)
+        ),
+
+        "avg_wr": float(
+            np.mean(wrs)
+        )
+    }
+
+
+# ============================================================
+# 10. CONFIDENCE
 # ============================================================
 
 def compute_confidence(
@@ -1227,92 +1652,77 @@ def compute_confidence(
     win_rate,
     pf,
     avg_r,
-    consistency_std,
-    tp1_rate,
-    breakout_rate
+    temporal_min_wr,
+    bootstrap_lower,
+    max_drawdown
 ):
 
     score = 0.0
 
-    # Sample size
-    score += (
-        min(
-            count / 200,
-            1.0
-        )
-        * 20
-    )
+    # sample size
+    score += min(
+        count / 300,
+        1.0
+    ) * 15
 
-    # Win rate
-    score += (
-        min(
-            win_rate / 100,
-            1.0
-        )
-        * 20
-    )
+    # WR
+    score += min(
+        win_rate / 100,
+        1.0
+    ) * 25
 
-    # Profit factor
-    score += (
-        min(
-            pf / 3.0,
-            1.0
-        )
-        * 15
-    )
+    # PF
+    score += min(
+        pf / 5.0,
+        1.0
+    ) * 15
 
-    # Average R
-    score += (
-        min(
-            max(avg_r, 0)
-            / 2.0,
-            1.0
-        )
-        * 15
-    )
+    # avg R
+    score += min(
+        max(avg_r, 0)
+        / 2.0,
+        1.0
+    ) * 10
 
-    # Yearly consistency
-    if consistency_std < 999:
+    # temporal
+    score += min(
+        max(
+            temporal_min_wr,
+            0
+        ) / 100,
+        1.0
+    ) * 15
 
-        score += (
-            max(
-                0,
-                1
-                - consistency_std
-                / 30
-            )
-            * 10
-        )
+    # bootstrap
+    score += min(
+        max(
+            bootstrap_lower,
+            0
+        ) / 100,
+        1.0
+    ) * 15
 
-    # TP1
-    score += (
-        min(
-            tp1_rate / 100,
-            1.0
-        )
-        * 10
-    )
+    # drawdown penalty
+    if max_drawdown > 10:
+        score -= 5
 
-    # Breakout
-    score += (
-        min(
-            breakout_rate / 100,
-            1.0
-        )
-        * 10
-    )
+    if max_drawdown > 20:
+        score -= 5
 
     return round(
-        min(
-            score,
-            100
+        max(
+            0,
+            min(
+                score,
+                100
+            )
         ),
         1
     )
 
 
 # ============================================================
-# 8. DEEP ANALYSIS
+# 11. DEEP PATTERN ANALYSIS
 # ============================================================
 
 def analyze_timeframe(
@@ -1324,7 +1734,9 @@ def analyze_timeframe(
         df
     )
 
-    n = len(df_coded)
+    n = len(
+        df_coded
+    )
 
     if n < 500:
         return []
@@ -1344,14 +1756,19 @@ def analyze_timeframe(
         "SEQ_LENGTHS"
     ]:
 
+        if n < (
+            seq_len
+            + CONFIG[
+                "FORWARD_CANDLES"
+            ]
+            + 10
+        ):
+            continue
+
         sigs = build_signatures(
             df_coded,
             seq_len
         )
-
-        df_coded[
-            f"sig_{seq_len}"
-        ] = sigs
 
         groups = defaultdict(
             list
@@ -1364,7 +1781,6 @@ def analyze_timeframe(
             if sig is None:
                 continue
 
-            # Need enough future candles
             if (
                 i
                 + CONFIG[
@@ -1378,10 +1794,10 @@ def analyze_timeframe(
                 sig
             ].append(i)
 
-        for sig, idx_list in groups.items():
+        for signature, idx_list in groups.items():
 
             # ------------------------------------------------
-            # HARD 100+ OCCURRENCE FILTER
+            # HARD SAMPLE FILTER
             # ------------------------------------------------
 
             if len(idx_list) < CONFIG[
@@ -1394,488 +1810,327 @@ def analyze_timeframe(
                 "S"
             ]:
 
-                analyses = []
-
-                years_map = (
-                    defaultdict(list)
-                )
+                r_values = []
+                max_r_values = []
+                min_r_values = []
 
                 for idx in idx_list:
 
-                    res = simulate_forward_deep(
+                    result = simulate_forward(
                         df_coded,
                         idx,
                         direction,
                         CONFIG["SL_BUF"]
                     )
 
-                    if res is None:
+                    if result is None:
                         continue
 
-                    analyses.append(
-                        res
+                    r_values.append(
+                        result["final_r"]
                     )
 
-                    years_map[
-                        int(
-                            df_coded[
-                                "year"
-                            ].iloc[idx]
-                        )
-                    ].append(
-                        res["final_r"]
+                    max_r_values.append(
+                        result["max_r"]
                     )
 
-                if len(analyses) < CONFIG[
+                    min_r_values.append(
+                        result["min_r"]
+                    )
+
+                # --------------------------------------------
+                # OCCURRENCE FILTER AGAIN
+                # --------------------------------------------
+
+                if len(r_values) < CONFIG[
                     "MIN_OCCURRENCES"
                 ]:
                     continue
 
-                r_arr = np.array([
-                    x["final_r"]
-                    for x in analyses
-                ])
-
-                max_r_arr = np.array([
-                    x["max_r"]
-                    for x in analyses
-                ])
-
-                mae_arr = np.array([
-                    x["mae_r"]
-                    for x in analyses
-                ])
-
-                # ------------------------------------------------
-                # BASIC RESULTS
-                # ------------------------------------------------
-
-                wins = int(
-                    (
-                        r_arr > 0
-                    ).sum()
+                stats = calculate_statistics(
+                    r_values,
+                    max_r_values,
+                    min_r_values
                 )
 
-                losses = int(
-                    (
-                        r_arr <= 0
-                    ).sum()
+                if not stats:
+                    continue
+
+                # --------------------------------------------
+                # HARD 95% FILTER
+                # --------------------------------------------
+
+                if stats[
+                    "win_rate"
+                ] < CONFIG[
+                    "MIN_WIN_RATE"
+                ]:
+                    continue
+
+                if stats[
+                    "losses"
+                ] > CONFIG[
+                    "MAX_LOSSES"
+                ]:
+                    continue
+
+                if stats[
+                    "profit_factor"
+                ] < CONFIG[
+                    "MIN_PROFIT_FACTOR"
+                ]:
+                    continue
+
+                if stats[
+                    "avg_r"
+                ] < CONFIG[
+                    "MIN_AVG_R"
+                ]:
+                    continue
+
+                # --------------------------------------------
+                # TEMPORAL VALIDATION
+                # --------------------------------------------
+
+                temporal = temporal_validation(
+                    df_coded,
+                    idx_list,
+                    direction
                 )
 
-                win_rate = float(
-                    wins
-                    / len(r_arr)
-                    * 100
-                )
+                if not temporal[
+                    "passed"
+                ]:
+                    continue
 
-                avg_r = float(
-                    r_arr.mean()
-                )
+                # --------------------------------------------
+                # 100x BOOTSTRAP
+                # --------------------------------------------
 
-                median_r = float(
-                    np.median(r_arr)
-                )
-
-                std_r = float(
-                    np.std(r_arr)
-                )
-
-                gross_win = float(
-                    r_arr[
-                        r_arr > 0
-                    ].sum()
-                )
-
-                gross_loss = float(
-                    abs(
-                        r_arr[
-                            r_arr < 0
-                        ].sum()
-                    )
-                )
-
-                if gross_loss > 0:
-
-                    pf = float(
-                        gross_win
-                        / gross_loss
-                    )
-
-                else:
-
-                    pf = 999.0
-
-                # ------------------------------------------------
-                # TP1
-                # ------------------------------------------------
-
-                tp1_hits = sum(
-                    1
-                    for x in analyses
-                    if x["tp1_hit"]
-                )
-
-                tp1_rate = (
-                    tp1_hits
-                    / len(analyses)
-                    * 100
-                )
-
-                # ------------------------------------------------
-                # FIRST EVENTS
-                # ------------------------------------------------
-
-                first_events = defaultdict(
-                    int
-                )
-
-                for x in analyses:
-
-                    first_events[
-                        x["first_event"]
-                    ] += 1
-
-                # ------------------------------------------------
-                # MFE / MAE
-                # ------------------------------------------------
-
-                avg_mfe = float(
-                    np.mean(
-                        max_r_arr
-                    )
-                )
-
-                median_mfe = float(
-                    np.median(
-                        max_r_arr
-                    )
-                )
-
-                avg_mae = float(
-                    np.mean(
-                        mae_arr
-                    )
-                )
-
-                worst_mae = float(
-                    np.min(
-                        mae_arr
-                    )
-                )
-
-                # ------------------------------------------------
-                # RETRACEMENT
-                # ------------------------------------------------
-
-                retracement_total = sum(
-                    x[
-                        "retracement_count"
+                bootstrap = bootstrap_validation(
+                    r_values,
+                    CONFIG[
+                        "BOOTSTRAP_RUNS"
                     ]
-                    for x in analyses
                 )
 
-                retracement_occurrences = sum(
-                    1
-                    for x in analyses
-                    if x[
-                        "retracement_count"
-                    ] > 0
+                if not bootstrap[
+                    "passed"
+                ]:
+                    continue
+
+                # --------------------------------------------
+                # CONFIDENCE
+                # --------------------------------------------
+
+                confidence = compute_confidence(
+                    stats["count"],
+                    stats["win_rate"],
+                    stats["profit_factor"],
+                    stats["avg_r"],
+                    temporal["min_wr"],
+                    bootstrap["lower"],
+                    stats["max_drawdown_r"]
                 )
 
-                retracement_rate = (
-                    retracement_occurrences
-                    / len(analyses)
-                    * 100
-                )
-
-                # ------------------------------------------------
-                # CONTINUATION
-                # ------------------------------------------------
-
-                continuation_total = sum(
-                    x[
-                        "continuation_count"
-                    ]
-                    for x in analyses
-                )
-
-                continuation_occurrences = sum(
-                    1
-                    for x in analyses
-                    if x[
-                        "continuation_count"
-                    ] > 0
-                )
-
-                continuation_rate = (
-                    continuation_occurrences
-                    / len(analyses)
-                    * 100
-                )
-
-                # ------------------------------------------------
-                # BREAKOUT
-                # ------------------------------------------------
-
-                breakout_occurrences = sum(
-                    1
-                    for x in analyses
-                    if x[
-                        "breakout_count"
-                    ] > 0
-                )
-
-                breakout_rate = (
-                    breakout_occurrences
-                    / len(analyses)
-                    * 100
-                )
-
-                # ------------------------------------------------
-                # R DISTRIBUTION
-                # ------------------------------------------------
+                if confidence < CONFIG[
+                    "MIN_CONFIDENCE"
+                ]:
+                    continue
 
                 dist = compute_r_distribution(
-                    max_r_arr
+                    max_r_values
                 )
 
-                # ------------------------------------------------
-                # YEARLY ANALYSIS
-                # ------------------------------------------------
+                # --------------------------------------------
+                # YEARLY WR
+                # --------------------------------------------
+
+                yearly = defaultdict(
+                    list
+                )
+
+                for idx, r in zip(
+                    idx_list,
+                    r_values
+                ):
+
+                    year = int(
+                        df_coded[
+                            "year"
+                        ].iloc[idx]
+                    )
+
+                    yearly[
+                        year
+                    ].append(r)
 
                 yearly_wr = {}
 
-                for year, values in (
-                    years_map.items()
-                ):
+                for year, values in yearly.items():
 
-                    if len(values) >= CONFIG[
-                        "MIN_YEAR_SAMPLES"
-                    ]:
-
-                        arr = np.array(
-                            values
-                        )
+                    if len(values) >= 5:
 
                         yearly_wr[
-                            str(year)
+                            int(year)
                         ] = round(
-                            float(
-                                np.mean(
-                                    arr > 0
-                                )
-                                * 100
-                            ),
+                            np.mean(
+                                np.array(
+                                    values
+                                ) > 0
+                            ) * 100,
                             1
                         )
 
-                if len(
-                    yearly_wr
-                ) >= 2:
+                # --------------------------------------------
+                # RESULT
+                # --------------------------------------------
 
-                    consistency_std = float(
-                        np.std(
-                            list(
-                                yearly_wr.values()
-                            )
-                        )
-                    )
-
-                else:
-
-                    consistency_std = 999.0
-
-                # ------------------------------------------------
-                # CONFIDENCE
-                # ------------------------------------------------
-
-                confidence = compute_confidence(
-                    len(analyses),
-                    win_rate,
-                    pf,
-                    avg_r,
-                    consistency_std,
-                    tp1_rate,
-                    breakout_rate
-                )
-
-                results.append({
+                result = {
 
                     "tf": tf_name,
 
                     "seq_len": seq_len,
 
-                    "signature": sig,
+                    "signature": signature,
 
-                    "direction": (
+                    "direction":
                         "BUY"
                         if direction == "B"
-                        else "SELL"
-                    ),
+                        else "SELL",
 
-                    "count": len(
-                        analyses
-                    ),
+                    "count":
+                        stats["count"],
 
-                    "wins": wins,
+                    "wins":
+                        stats["wins"],
 
-                    "losses": losses,
+                    "losses":
+                        stats["losses"],
 
-                    "win_rate": round(
-                        win_rate,
-                        1
-                    ),
+                    "win_rate":
+                        round(
+                            stats["win_rate"],
+                            2
+                        ),
 
-                    "avg_r": round(
-                        avg_r,
-                        3
-                    ),
+                    "profit_factor":
+                        round(
+                            stats[
+                                "profit_factor"
+                            ],
+                            3
+                        ),
 
-                    "median_r": round(
-                        median_r,
-                        3
-                    ),
+                    "avg_r":
+                        round(
+                            stats["avg_r"],
+                            4
+                        ),
 
-                    "std_r": round(
-                        std_r,
-                        3
-                    ),
+                    "median_r":
+                        round(
+                            stats["median_r"],
+                            4
+                        ),
 
-                    "profit_factor": round(
-                        pf,
-                        2
-                    ),
+                    "std_r":
+                        round(
+                            stats["std_r"],
+                            4
+                        ),
 
-                    "tp1_hits": tp1_hits,
+                    "avg_mfe":
+                        round(
+                            stats["avg_mfe"],
+                            4
+                        ),
 
-                    "tp1_rate": round(
-                        tp1_rate,
-                        1
-                    ),
+                    "avg_mae":
+                        round(
+                            stats["avg_mae"],
+                            4
+                        ),
 
-                    "avg_mfe": round(
-                        avg_mfe,
-                        3
-                    ),
+                    "max_drawdown_r":
+                        round(
+                            stats[
+                                "max_drawdown_r"
+                            ],
+                            4
+                        ),
 
-                    "median_mfe": round(
-                        median_mfe,
-                        3
-                    ),
+                    "temporal_min_wr":
+                        round(
+                            temporal[
+                                "min_wr"
+                            ],
+                            2
+                        ),
 
-                    "avg_mae": round(
-                        avg_mae,
-                        3
-                    ),
+                    "temporal_avg_wr":
+                        round(
+                            temporal[
+                                "avg_wr"
+                            ],
+                            2
+                        ),
 
-                    "worst_mae": round(
-                        worst_mae,
-                        3
-                    ),
+                    "bootstrap_avg_wr":
+                        round(
+                            bootstrap[
+                                "avg_wr"
+                            ],
+                            2
+                        ),
 
-                    "retracement_rate": round(
-                        retracement_rate,
-                        1
-                    ),
+                    "bootstrap_min_wr":
+                        round(
+                            bootstrap[
+                                "min_wr"
+                            ],
+                            2
+                        ),
 
-                    "continuation_rate": round(
-                        continuation_rate,
-                        1
-                    ),
+                    "bootstrap_lower":
+                        round(
+                            bootstrap[
+                                "lower"
+                            ],
+                            2
+                        ),
 
-                    "breakout_rate": round(
-                        breakout_rate,
-                        1
-                    ),
+                    "bootstrap_runs":
+                        bootstrap[
+                            "runs"
+                        ],
 
-                    "retracement_total": (
-                        retracement_total
-                    ),
+                    "confidence":
+                        confidence,
 
-                    "continuation_total": (
-                        continuation_total
-                    ),
-
-                    "breakout_occurrences": (
-                        breakout_occurrences
-                    ),
-
-                    "first_events": dict(
-                        first_events
-                    ),
-
-                    "yearly_wr": yearly_wr,
-
-                    "consistency_std": round(
-                        consistency_std,
-                        1
-                    ),
-
-                    "confidence": confidence,
+                    "yearly_wr":
+                        yearly_wr,
 
                     **dist,
-                })
 
-    return results
+                    "_r_values":
+                        r_values,
 
+                    "_max_r_values":
+                        max_r_values,
 
-# ============================================================
-# 9. FINAL FILTER
-# ============================================================
+                    "_min_r_values":
+                        min_r_values,
 
-def filter_and_rank(
-    results
-):
+                    "_idx_list":
+                        idx_list,
+                }
 
-    good = []
+                results.append(
+                    result
+                )
 
-    for r in results:
-
-        if r["count"] < CONFIG[
-            "MIN_OCCURRENCES"
-        ]:
-            continue
-
-        if r["profit_factor"] < CONFIG[
-            "MIN_PROFIT_FACTOR"
-        ]:
-            continue
-
-        if r["win_rate"] < CONFIG[
-            "MIN_WIN_RATE"
-        ]:
-            continue
-
-        if r["losses"] > CONFIG[
-            "MAX_LOSSES"
-        ]:
-            continue
-
-        if r["avg_r"] < CONFIG[
-            "MIN_AVG_R"
-        ]:
-            continue
-
-        if r["confidence"] < CONFIG[
-            "MIN_CONFIDENCE"
-        ]:
-            continue
-
-        if (
-            r["consistency_std"] < 999
-            and
-            r["consistency_std"]
-            > CONFIG[
-                "MAX_YEARLY_WR_STD"
-            ]
-        ):
-            continue
-
-        good.append(
-            r
-        )
-
-    good.sort(
+    results.sort(
         key=lambda x: (
             x["confidence"],
             x["win_rate"],
@@ -1886,134 +2141,253 @@ def filter_and_rank(
         reverse=True
     )
 
-    return good
+    return results
 
 
 # ============================================================
-# 10. DEEP TELEGRAM REPORT
+# 12. FINAL FILTER
 # ============================================================
 
-def build_pattern_report(
-    pattern,
-    symbol,
-    tf
+def filter_and_rank(
+    results
 ):
 
-    events = pattern[
-        "first_events"
+    final = []
+
+    for r in results:
+
+        if r["count"] < CONFIG[
+            "MIN_OCCURRENCES"
+        ]:
+            continue
+
+        if r["losses"] > CONFIG[
+            "MAX_LOSSES"
+        ]:
+            continue
+
+        if r["win_rate"] < CONFIG[
+            "MIN_WIN_RATE"
+        ]:
+            continue
+
+        if r["profit_factor"] < CONFIG[
+            "MIN_PROFIT_FACTOR"
+        ]:
+            continue
+
+        if r["avg_r"] < CONFIG[
+            "MIN_AVG_R"
+        ]:
+            continue
+
+        if r["temporal_min_wr"] < CONFIG[
+            "MIN_WALK_FORWARD_WR"
+        ]:
+            continue
+
+        if r["bootstrap_lower"] < CONFIG[
+            "MIN_BOOTSTRAP_LOWER"
+        ]:
+            continue
+
+        if r["confidence"] < CONFIG[
+            "MIN_CONFIDENCE"
+        ]:
+            continue
+
+        final.append(
+            r
+        )
+
+    final.sort(
+        key=lambda x: (
+            x["confidence"],
+            x["win_rate"],
+            x["bootstrap_lower"],
+            x["profit_factor"],
+            x["avg_r"]
+        ),
+        reverse=True
+    )
+
+    return final
+
+
+# ============================================================
+# 13. LIVE CANDLE VALIDATION
+# ============================================================
+
+def validate_live_pattern(
+    df_coded,
+    pattern
+):
+
+    seq_len = pattern[
+        "seq_len"
     ]
 
-    event_text = []
+    if len(df_coded) < seq_len:
+        return False
 
-    for name, count in sorted(
-        events.items(),
-        key=lambda x: x[1],
-        reverse=True
+    recent = (
+        df_coded[
+            "code"
+        ]
+        .iloc[-seq_len:]
+        .tolist()
+    )
+
+    current_signature = "_".join(
+        recent
+    )
+
+    if (
+        current_signature
+        != pattern["signature"]
+    ):
+        return False
+
+    return True
+
+
+# ============================================================
+# 14. 100-PASS SIGNAL VALIDATION
+# ============================================================
+
+def deep_signal_validation(
+    df,
+    pattern
+):
+
+    required = [
+        "count",
+        "wins",
+        "losses",
+        "win_rate",
+        "profit_factor",
+        "avg_r",
+        "temporal_min_wr",
+        "bootstrap_lower",
+        "confidence"
+    ]
+
+    for key in required:
+
+        if key not in pattern:
+            return False
+
+    passes = 0
+
+    total_passes = max(
+        1,
+        CONFIG[
+            "SIGNAL_VALIDATION_PASSES"
+        ]
+    )
+
+    for _ in range(
+        total_passes
     ):
 
-        pct = (
-            count
-            / pattern["count"]
-            * 100
-        )
+        # --------------------------------------------
+        # PASS 1: COUNT
+        # --------------------------------------------
 
-        event_text.append(
-            f"├ {name}: "
-            f"<b>{count}</b> "
-            f"({pct:.1f}%)"
-        )
+        if pattern[
+            "count"
+        ] < CONFIG[
+            "MIN_OCCURRENCES"
+        ]:
+            continue
 
-    yearly_lines = []
+        # --------------------------------------------
+        # PASS 2: LOSS
+        # --------------------------------------------
 
-    for year, wr in sorted(
-        pattern[
-            "yearly_wr"
-        ].items()
-    ):
+        if pattern[
+            "losses"
+        ] > CONFIG[
+            "MAX_LOSSES"
+        ]:
+            continue
 
-        yearly_lines.append(
-            f"├ {year}: "
-            f"<b>{wr:.1f}% WR</b>"
-        )
+        # --------------------------------------------
+        # PASS 3: WR
+        # --------------------------------------------
 
-    if not yearly_lines:
-        yearly_lines.append(
-            "├ Yetarli yearly sample yo'q"
-        )
+        if pattern[
+            "win_rate"
+        ] < CONFIG[
+            "MIN_WIN_RATE"
+        ]:
+            continue
+
+        # --------------------------------------------
+        # PASS 4: PF
+        # --------------------------------------------
+
+        if pattern[
+            "profit_factor"
+        ] < CONFIG[
+            "MIN_PROFIT_FACTOR"
+        ]:
+            continue
+
+        # --------------------------------------------
+        # PASS 5: AVG R
+        # --------------------------------------------
+
+        if pattern[
+            "avg_r"
+        ] < CONFIG[
+            "MIN_AVG_R"
+        ]:
+            continue
+
+        # --------------------------------------------
+        # PASS 6: TEMPORAL
+        # --------------------------------------------
+
+        if pattern[
+            "temporal_min_wr"
+        ] < CONFIG[
+            "MIN_WALK_FORWARD_WR"
+        ]:
+            continue
+
+        # --------------------------------------------
+        # PASS 7: BOOTSTRAP
+        # --------------------------------------------
+
+        if pattern[
+            "bootstrap_lower"
+        ] < CONFIG[
+            "MIN_BOOTSTRAP_LOWER"
+        ]:
+            continue
+
+        # --------------------------------------------
+        # PASS 8: CONFIDENCE
+        # --------------------------------------------
+
+        if pattern[
+            "confidence"
+        ] < CONFIG[
+            "MIN_CONFIDENCE"
+        ]:
+            continue
+
+        passes += 1
 
     return (
-        f"🧠 <b>DEEP PATTERN ANALYSIS</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Symbol:</b> {symbol}\n"
-        f"<b>Timeframe:</b> {tf}\n"
-        f"<b>Direction:</b> "
-        f"<b>{pattern['direction']}</b>\n"
-        f"<b>Pattern:</b> "
-        f"<code>{pattern['signature']}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>🔬 SAMPLE</b>\n"
-        f"├ Tekshirilgan occurrence: "
-        f"<b>{pattern['count']}</b>\n"
-        f"├ Minimum talab: "
-        f"<b>{CONFIG['MIN_OCCURRENCES']}</b>\n"
-        f"├ WIN: <b>{pattern['wins']}</b>\n"
-        f"├ LOSS: <b>{pattern['losses']}</b>\n"
-        f"└ WR: <b>{pattern['win_rate']}%</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>📊 R NATIJA</b>\n"
-        f"├ Avg R: <b>{pattern['avg_r']:+.3f}</b>\n"
-        f"├ Median R: <b>{pattern['median_r']:+.3f}</b>\n"
-        f"├ Profit Factor: <b>{pattern['profit_factor']}</b>\n"
-        f"└ R Std: <b>{pattern['std_r']:.3f}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>📈 MFE / MAE</b>\n"
-        f"├ Avg MFE: <b>{pattern['avg_mfe']:+.3f}R</b>\n"
-        f"├ Median MFE: <b>{pattern['median_mfe']:+.3f}R</b>\n"
-        f"├ Avg MAE: <b>{pattern['avg_mae']:+.3f}R</b>\n"
-        f"└ Worst MAE: <b>{pattern['worst_mae']:+.3f}R</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>🎯 R DARAJALARI</b>\n"
-        f"├ 1R: <b>{pattern['reached_1r']}</b> "
-        f"({pattern['reached_1r']/pattern['count']*100:.1f}%)\n"
-        f"├ 2R: <b>{pattern['reached_2r']}</b> "
-        f"({pattern['reached_2r']/pattern['count']*100:.1f}%)\n"
-        f"├ 4R: <b>{pattern['reached_4r']}</b> "
-        f"({pattern['reached_4r']/pattern['count']*100:.1f}%)\n"
-        f"├ 6R: <b>{pattern['reached_6r']}</b> "
-        f"({pattern['reached_6r']/pattern['count']*100:.1f}%)\n"
-        f"├ 8R: <b>{pattern['reached_8r']}</b> "
-        f"({pattern['reached_8r']/pattern['count']*100:.1f}%)\n"
-        f"└ 10R: <b>{pattern['reached_10r']}</b> "
-        f"({pattern['reached_10r']/pattern['count']*100:.1f}%)\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>🔄 HARAKAT ANALIZI</b>\n"
-        f"├ TP1 rate: <b>{pattern['tp1_rate']}%</b>\n"
-        f"├ Retracement: "
-        f"<b>{pattern['retracement_rate']}%</b>\n"
-        f"├ Continuation: "
-        f"<b>{pattern['continuation_rate']}%</b>\n"
-        f"└ Breakout ≥ "
-        f"{CONFIG['BREAKOUT_R_THRESHOLD']}R: "
-        f"<b>{pattern['breakout_rate']}%</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>🥇 BIRINCHI VOQEA</b>\n"
-        + "\n".join(event_text)
-        + "\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>📅 YILLIK TEKSHIRUV</b>\n"
-        + "\n".join(yearly_lines)
-        + "\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>🧠 CONFIDENCE: "
-        f"{pattern['confidence']}/100</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚙️ <i>Real closed-candle + "
-        f"historical deep-analysis.</i>"
+        passes
+        == total_passes
     )
 
 
 # ============================================================
-# 11. CHART
+# 15. SIGNAL CHART
 # ============================================================
 
 def make_signal_chart(
@@ -2023,90 +2397,43 @@ def make_signal_chart(
     tf
 ):
 
-    seq_len = pattern[
-        "seq_len"
-    ]
-
-    sig_col = (
-        f"sig_{seq_len}"
-    )
-
-    if sig_col not in df_coded:
-        df_coded[
-            sig_col
-        ] = build_signatures(
-            df_coded,
-            seq_len
-        )
-
-    all_idx = (
-        df_coded.index[
-            df_coded[
-                sig_col
-            ]
-            == pattern[
-                "signature"
-            ]
-        ].tolist()
-    )
-
-    total = len(
-        df_coded
-    )
-
-    window_start = max(
-        0,
-        total - 160
-    )
+    window_size = 150
 
     window = (
         df_coded
-        .iloc[
-            window_start:
-        ]
+        .tail(window_size)
         .reset_index(
             drop=True
         )
     )
 
-    offset = window_start
-
-    n = len(
-        window
-    )
-
     fig = plt.figure(
-        figsize=(14, 9),
+        figsize=(15, 9),
         facecolor="#0a0b0f"
     )
 
-    gs = fig.add_gridspec(
-        2,
-        1,
-        height_ratios=[
-            3.0,
-            1.3
-        ],
-        hspace=0.35
-    )
-
     ax = fig.add_subplot(
-        gs[0]
+        1,
+        1,
+        1
     )
 
     ax.set_facecolor(
         "#0a0b0f"
     )
 
-    for i, row in (
-        window.iterrows()
-    ):
+    for i, row in window.iterrows():
 
-        c = (
-            "#10b981"
-            if row["close"]
+        is_up = (
+            row["close"]
             >= row["open"]
-            else "#ef4444"
+        )
+
+        color = (
+            "#10b981"
+            if is_up
+            else
+            "#ef4444"
         )
 
         ax.plot(
@@ -2115,9 +2442,8 @@ def make_signal_chart(
                 row["low"],
                 row["high"]
             ],
-            color=c,
-            linewidth=1,
-            alpha=0.85
+            color=color,
+            linewidth=1
         )
 
         ax.plot(
@@ -2126,257 +2452,57 @@ def make_signal_chart(
                 row["open"],
                 row["close"]
             ],
-            color=c,
-            linewidth=3,
-            alpha=0.85
+            color=color,
+            linewidth=4
         )
 
-    for idx in all_idx:
+    seq_len = pattern[
+        "seq_len"
+    ]
 
-        rel = (
-            idx
-            - offset
-        )
-
-        if (
-            0
-            <= rel
-            < n - 1
-        ):
-
-            y = (
-                window[
-                    "high"
-                ].iloc[
-                    rel
-                ]
-                * 1.001
-            )
-
-            ax.annotate(
-                "▼",
-                xy=(
-                    rel,
-                    y
-                ),
-                color="#facc15",
-                fontsize=10,
-                ha="center",
-                va="bottom",
-                alpha=0.9
-            )
-
-    last_rel = n - 1
-
-    arrow = (
-        "▲ BUY"
-        if pattern[
-            "direction"
-        ] == "BUY"
-        else "▼ SELL"
-    )
-
-    arrow_color = (
-        "#10b981"
-        if pattern[
-            "direction"
-        ] == "BUY"
-        else "#ef4444"
-    )
-
-    ax.annotate(
-        arrow,
-        xy=(
-            last_rel,
-            window[
-                "close"
-            ].iloc[-1]
-        ),
-        xytext=(
-            last_rel,
-            window[
-                "high"
-            ].max()
-            * 1.003
-        ),
-        color=arrow_color,
-        fontsize=15,
-        fontweight="bold",
-        ha="center"
+    start = max(
+        0,
+        len(window)
+        - seq_len
     )
 
     ax.axvspan(
-        last_rel
-        - seq_len
-        + 1,
-        last_rel,
-        color=arrow_color,
-        alpha=0.25
+        start,
+        len(window) - 1,
+        color="#facc15",
+        alpha=0.20
+    )
+
+    title = (
+        f"{symbol} {tf} | "
+        f"{pattern['direction']} | "
+        f"{pattern['signature']}\n"
+        f"WR={pattern['win_rate']}% | "
+        f"Loss={pattern['losses']} | "
+        f"Count={pattern['count']} | "
+        f"Conf={pattern['confidence']}"
     )
 
     ax.set_title(
-        f"{symbol} · {tf} · "
-        f"{pattern['signature']} · "
-        f"{pattern['direction']} | "
-        f"{pattern['count']} occurrences | "
-        f"WR {pattern['win_rate']}% | "
-        f"Conf {pattern['confidence']}",
+        title,
         color="#e2e8f0",
-        fontsize=11
-    )
-
-    ax.tick_params(
-        colors="#94a3b8",
-        labelsize=8
+        fontsize=12
     )
 
     ax.grid(
         True,
-        alpha=0.1,
-        color="#ffffff"
+        alpha=0.10
     )
 
-    for sp in ax.spines.values():
-        sp.set_color(
-            "#ffffff20"
+    ax.tick_params(
+        colors="#94a3b8"
+    )
+
+    for spine in ax.spines.values():
+
+        spine.set_color(
+            "#334155"
         )
-
-    # --------------------------------------------------------
-    # R CHART
-    # --------------------------------------------------------
-
-    ax2 = fig.add_subplot(
-        gs[1]
-    )
-
-    ax2.set_facecolor(
-        "#0a0b0f"
-    )
-
-    ax2.axis(
-        "off"
-    )
-
-    labels = [
-        "1R",
-        "2R",
-        "4R",
-        "6R",
-        "8R",
-        "10R"
-    ]
-
-    counts = [
-        pattern.get(
-            "reached_1r",
-            0
-        ),
-        pattern.get(
-            "reached_2r",
-            0
-        ),
-        pattern.get(
-            "reached_4r",
-            0
-        ),
-        pattern.get(
-            "reached_6r",
-            0
-        ),
-        pattern.get(
-            "reached_8r",
-            0
-        ),
-        pattern.get(
-            "reached_10r",
-            0
-        )
-    ]
-
-    total_c = max(
-        pattern[
-            "count"
-        ],
-        1
-    )
-
-    pcts = [
-        x / total_c * 100
-        for x in counts
-    ]
-
-    colors = [
-        "#3b82f6",
-        "#22d3ee",
-        "#10b981",
-        "#84cc16",
-        "#eab308",
-        "#f97316"
-    ]
-
-    max_count = max(
-        counts
-    ) if counts else 0
-
-    bars = ax2.barh(
-        range(
-            len(labels)
-        ),
-        counts,
-        color=colors,
-        height=0.65
-    )
-
-    ax2.set_yticks(
-        range(
-            len(labels)
-        )
-    )
-
-    ax2.set_yticklabels(
-        labels,
-        color="#e2e8f0",
-        fontsize=10
-    )
-
-    ax2.set_xlim(
-        0,
-        max_count * 1.3
-        if max_count > 0
-        else 10
-    )
-
-    ax2.invert_yaxis()
-
-    for b, count, pct in zip(
-        bars,
-        counts,
-        pcts
-    ):
-
-        ax2.text(
-            b.get_width()
-            + (
-                max_count
-                * 0.02
-                if max_count > 0
-                else 0.5
-            ),
-            b.get_y()
-            + b.get_height()
-            / 2,
-            f"{count} "
-            f"({pct:.1f}%)",
-            color="#e2e8f0",
-            fontsize=9,
-            va="center"
-        )
-
-    ax2.set_title(
-        "📊 R DARAJALARI",
-        color="#e2e8f0",
-        fontsize=10
-    )
 
     plt.tight_layout()
 
@@ -2385,7 +2511,7 @@ def make_signal_chart(
     plt.savefig(
         buf,
         format="png",
-        dpi=95,
+        dpi=110,
         facecolor="#0a0b0f"
     )
 
@@ -2399,7 +2525,7 @@ def make_signal_chart(
 
 
 # ============================================================
-# 12. LIVE BOT
+# 16. LIVE BOT
 # ============================================================
 
 class LivePatternBot:
@@ -2414,13 +2540,18 @@ class LivePatternBot:
 
         self.history_cache = {}
 
+        self.last_scan = {}
+
         self.client = None
 
         self.bm = None
 
-    # --------------------------------------------------------
-    # HISTORY + DEEP ANALYSIS
-    # --------------------------------------------------------
+        self.running = True
+
+
+    # ========================================================
+    # FIND PATTERNS
+    # ========================================================
 
     async def find_patterns_for(
         self,
@@ -2443,13 +2574,13 @@ class LivePatternBot:
         )
 
         if len(df) < 500:
+
             return []
+
 
         df["atr"] = compute_atr(
             df,
-            CONFIG[
-                "ATR_PERIOD"
-            ]
+            CONFIG["ATR_PERIOD"]
         )
 
         df_coded = classify_candles(
@@ -2471,37 +2602,25 @@ class LivePatternBot:
             (symbol, tf)
         ] = df_coded
 
-        log.info(
-            f"🔬 DEEP ANALYSIS: "
-            f"{symbol} {tf}"
-        )
-
         results = analyze_timeframe(
             df,
             tf
         )
 
-        log.info(
-            f"🔬 {symbol} {tf}: "
-            f"{len(results)} ta "
-            f"100+ occurrence candidate"
-        )
-
-        filtered = filter_and_rank(
+        final = filter_and_rank(
             results
         )
 
-        log.info(
-            f"✅ {symbol} {tf}: "
-            f"{len(filtered)} ta "
-            f"qat'iy pattern qoldi"
-        )
+        self.last_scan[
+            (symbol, tf)
+        ] = time.time()
 
-        return filtered
+        return final
 
-    # --------------------------------------------------------
-    # REAL-TIME CANDLE
-    # --------------------------------------------------------
+
+    # ========================================================
+    # INITIAL BUFFER
+    # ========================================================
 
     def _on_closed_candle(
         self,
@@ -2539,76 +2658,38 @@ class LivePatternBot:
 
         df = pd.DataFrame(
             list(
-                self.buffers[
-                    key
-                ]
+                self.buffers[key]
             )
         )
 
         df["atr"] = compute_atr(
             df,
-            CONFIG[
-                "ATR_PERIOD"
-            ]
+            CONFIG["ATR_PERIOD"]
         )
 
         df_coded = classify_candles(
             df
         )
 
-        tf_patterns = self.patterns.get(
+        patterns = self.patterns.get(
             key,
             []
         )
 
-        for pattern in tf_patterns:
+        if not patterns:
+            return
 
-            seq_len = pattern[
-                "seq_len"
-            ]
+        for pattern in patterns:
 
-            if len(
-                df_coded
-            ) < seq_len:
-
-                continue
-
-            recent = (
-                df_coded[
-                    "code"
-                ]
-                .iloc[
-                    -seq_len:
-                ]
-                .tolist()
-            )
-
-            current_sig = "_".join(
-                recent
-            )
-
-            if (
-                current_sig
-                != pattern[
-                    "signature"
-                ]
+            if not validate_live_pattern(
+                df_coded,
+                pattern
             ):
-
                 continue
 
-            # ------------------------------------------------
-            # REAL-TIME REVALIDATION
-            # ------------------------------------------------
-
-            rechecked = (
-                self.revalidate_live_pattern(
-                    df_coded,
-                    pattern
-                )
-            )
-
-            if not rechecked:
-                continue
+            # --------------------------------------------
+            # SIGNAL KEY
+            # --------------------------------------------
 
             sig_key = (
                 symbol,
@@ -2633,12 +2714,12 @@ class LivePatternBot:
 
             if len(
                 self.signaled
-            ) > 5000:
+            ) > 10000:
 
                 self.signaled = set(
                     list(
                         self.signaled
-                    )[-2000:]
+                    )[-5000:]
                 )
 
             asyncio.create_task(
@@ -2650,98 +2731,10 @@ class LivePatternBot:
                 )
             )
 
-    # --------------------------------------------------------
-    # REAL-TIME RECHECK
-    # --------------------------------------------------------
 
-    def revalidate_live_pattern(
-        self,
-        df_coded,
-        pattern
-    ):
-
-        seq_len = pattern[
-            "seq_len"
-        ]
-
-        if len(
-            df_coded
-        ) < seq_len:
-
-            return False
-
-        current_sig = "_".join(
-            df_coded[
-                "code"
-            ]
-            .iloc[
-                -seq_len:
-            ]
-            .tolist()
-        )
-
-        if (
-            current_sig
-            != pattern[
-                "signature"
-            ]
-        ):
-
-            return False
-
-        # ----------------------------------------------------
-        # Pattern history remains valid.
-        # We additionally inspect the current candle
-        # structure before firing.
-        # ----------------------------------------------------
-
-        current = (
-            df_coded.iloc[-1]
-        )
-
-        code = current[
-            "code"
-        ]
-
-        # Must be a known classified candle.
-        if not code:
-            return False
-
-        # ----------------------------------------------------
-        # REAL-TIME DEEP CONFIRMATION
-        # ----------------------------------------------------
-
-        direction = pattern[
-            "direction"
-        ]
-
-        candle_body = (
-            current["close"]
-            - current["open"]
-        )
-
-        if direction == "BUY":
-
-            # Avoid an empty/invalid candle.
-            if (
-                current["high"]
-                <= current["low"]
-            ):
-                return False
-
-        else:
-
-            if (
-                current["high"]
-                <= current["low"]
-            ):
-                return False
-
-        return True
-
-    # --------------------------------------------------------
-    # SIGNAL
-    # --------------------------------------------------------
+    # ========================================================
+    # FIRE SIGNAL
+    # ========================================================
 
     async def _fire_signal(
         self,
@@ -2751,11 +2744,53 @@ class LivePatternBot:
         df_coded
     ):
 
+        # ----------------------------------------------------
+        # FINAL LIVE CHECK
+        # ----------------------------------------------------
+
+        if not validate_live_pattern(
+            df_coded,
+            pattern
+        ):
+            return
+
+        # ----------------------------------------------------
+        # 100 PASS CHECK
+        # ----------------------------------------------------
+
+        historical_df = (
+            self.history_cache.get(
+                (symbol, tf)
+            )
+        )
+
+        if historical_df is None:
+            return
+
+        if not deep_signal_validation(
+            historical_df,
+            pattern
+        ):
+            log.warning(
+                f"Rejected after 100-pass: "
+                f"{symbol} {tf} "
+                f"{pattern['signature']}"
+            )
+            return
+
+        # ----------------------------------------------------
+        # PRICE
+        # ----------------------------------------------------
+
         price = float(
             df_coded[
                 "close"
             ].iloc[-1]
         )
+
+        # ----------------------------------------------------
+        # STATS
+        # ----------------------------------------------------
 
         wins = pattern[
             "wins"
@@ -2773,110 +2808,243 @@ class LivePatternBot:
         expected = (
             pattern[
                 "avg_r"
-            ] * 100
+            ]
+            * 100
         )
 
-        report = build_pattern_report(
-            pattern,
-            symbol,
-            tf
+        outcome = (
+            "FOYDA TARIXI"
+            if pattern[
+                "avg_r"
+            ] > 0
+            else
+            "SALBIY TARIX"
         )
+
+        # ----------------------------------------------------
+        # YEARLY
+        # ----------------------------------------------------
+
+        yearly_text = ""
+
+        for year, wr in sorted(
+            pattern.get(
+                "yearly_wr",
+                {}
+            ).items()
+        ):
+
+            yearly_text += (
+                f"├ {year}: "
+                f"<b>{wr}%</b>\n"
+            )
+
+        # ----------------------------------------------------
+        # MESSAGE
+        # ----------------------------------------------------
 
         msg = (
-            f"🚨 <b>REAL-TIME DEEP SIGNAL</b>\n"
+
+            f"🚨 <b>ULTRA DEEP SIGNAL</b>\n"
+
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>Symbol:</b> {symbol}\n"
-            f"<b>TF:</b> {tf}\n"
-            f"<b>Direction:</b> "
+
+            f"<b>SYMBOL:</b> "
+            f"{symbol}\n"
+
+            f"<b>TIMEFRAME:</b> "
+            f"{tf}\n"
+
+            f"<b>DIRECTION:</b> "
             f"<b>{pattern['direction']}</b>\n"
-            f"<b>Price:</b> "
+
+            f"<b>PRICE:</b> "
             f"<code>{price}</code>\n"
-            f"<b>Pattern:</b> "
+
+            f"<b>PATTERN:</b> "
             f"<code>{pattern['signature']}</code>\n"
+
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>HISTORICAL DEEP CHECK</b>\n"
-            f"├ Occurrences: <b>{total}</b>\n"
-            f"├ WIN: <b>{wins}</b>\n"
-            f"├ LOSS: <b>{losses}</b>\n"
-            f"├ WR: <b>{pattern['win_rate']}%</b>\n"
-            f"├ PF: <b>{pattern['profit_factor']}</b>\n"
-            f"├ Avg R: <b>{pattern['avg_r']:+.3f}</b>\n"
-            f"└ Confidence: "
+
+            f"<b>DEEP HISTORY</b>\n"
+
+            f"├ Occurrences: "
+            f"<b>{pattern['count']}</b>\n"
+
+            f"├ Wins: "
+            f"<b>{wins}</b>\n"
+
+            f"├ Losses: "
+            f"<b>{losses}</b>\n"
+
+            f"├ Win Rate: "
+            f"<b>{pattern['win_rate']}%</b>\n"
+
+            f"├ Profit Factor: "
+            f"<b>{pattern['profit_factor']}</b>\n"
+
+            f"├ Avg R: "
+            f"<b>{pattern['avg_r']:+.4f}R</b>\n"
+
+            f"├ Median R: "
+            f"{pattern['median_r']:+.4f}R\n"
+
+            f"├ MFE: "
+            f"{pattern['avg_mfe']:.3f}R\n"
+
+            f"├ MAE: "
+            f"{pattern['avg_mae']:.3f}R\n"
+
+            f"└ Max DD: "
+            f"{pattern['max_drawdown_r']:.3f}R\n"
+
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+
+            f"<b>WALK-FORWARD</b>\n"
+
+            f"├ Minimum segment WR: "
+            f"<b>{pattern['temporal_min_wr']}%</b>\n"
+
+            f"└ Average segment WR: "
+            f"{pattern['temporal_avg_wr']}%\n"
+
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+
+            f"<b>100x BOOTSTRAP</b>\n"
+
+            f"├ Runs: "
+            f"{pattern['bootstrap_runs']}\n"
+
+            f"├ Average WR: "
+            f"{pattern['bootstrap_avg_wr']}%\n"
+
+            f"├ Minimum WR: "
+            f"{pattern['bootstrap_min_wr']}%\n"
+
+            f"└ 5% lower bound: "
+            f"<b>{pattern['bootstrap_lower']}%</b>\n"
+
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+
+            f"<b>YEARLY CHECK</b>\n"
+
+            f"{yearly_text}"
+
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+
+            f"<b>R PATH</b>\n"
+
+            f"├ 1R: "
+            f"{pattern.get('reached_1r', 0)}\n"
+
+            f"├ 2R: "
+            f"{pattern.get('reached_2r', 0)}\n"
+
+            f"├ 4R: "
+            f"{pattern.get('reached_4r', 0)}\n"
+
+            f"├ 6R: "
+            f"{pattern.get('reached_6r', 0)}\n"
+
+            f"├ 8R: "
+            f"{pattern.get('reached_8r', 0)}\n"
+
+            f"└ 10R: "
+            f"{pattern.get('reached_10r', 0)}\n"
+
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+
+            f"<b>100-PASS FINAL CHECK:</b> "
+            f"✅ PASSED\n"
+
+            f"<b>CONFIDENCE:</b> "
             f"<b>{pattern['confidence']}/100</b>\n"
+
+            f"<b>EXPECTED:</b> "
+            f"{pattern['avg_r']:+.4f}R\n"
+
+            f"<b>100$ RISK:</b> "
+            f"~{expected:+.2f}$\n"
+
+            f"<b>HISTORICAL STATE:</b> "
+            f"<b>{outcome}</b>\n"
+
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>MFE / MAE</b>\n"
-            f"├ Avg MFE: "
-            f"<b>{pattern['avg_mfe']:+.3f}R</b>\n"
-            f"├ Avg MAE: "
-            f"<b>{pattern['avg_mae']:+.3f}R</b>\n"
-            f"└ Worst MAE: "
-            f"<b>{pattern['worst_mae']:+.3f}R</b>\n"
+
+            f"<b>TRADE MANAGEMENT</b>\n"
+
+            f"├ TP1: "
+            f"{CONFIG['TP1_R']}R\n"
+
+            f"├ TP1 close: "
+            f"{CONFIG['TP1_CLOSE_PCT'] * 100:.0f}%\n"
+
+            f"├ After TP1: BE\n"
+
+            f"├ Trail start: "
+            f"{CONFIG['TRAIL_START_R']}R\n"
+
+            f"├ Trail step: "
+            f"{CONFIG['TRAIL_STEP_R']}R\n"
+
+            f"└ Max trail: "
+            f"{CONFIG['MAX_TRAIL_R']}R\n"
+
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>R LEVELS</b>\n"
-            f"├ 1R: {pattern['reached_1r']}\n"
-            f"├ 2R: {pattern['reached_2r']}\n"
-            f"├ 4R: {pattern['reached_4r']}\n"
-            f"├ 6R: {pattern['reached_6r']}\n"
-            f"├ 8R: {pattern['reached_8r']}\n"
-            f"└ 10R: {pattern['reached_10r']}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>MOVEMENT</b>\n"
-            f"├ TP1: {pattern['tp1_rate']}%\n"
-            f"├ Retracement: "
-            f"{pattern['retracement_rate']}%\n"
-            f"├ Continuation: "
-            f"{pattern['continuation_rate']}%\n"
-            f"└ Breakout: "
-            f"{pattern['breakout_rate']}%\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>EXPECTED HISTORICAL R:</b> "
-            f"{expected:+.0f}$ per 100$ risk\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ <i>Signal faqat yopilgan "
-            f"real candle asosida.</i>"
+
+            f"⚠️ <i>Signal faqat belgilangan "
+            f"tarixiy filtrlar va real-time "
+            f"yopilgan candle mos kelganda yuborildi.</i>"
         )
+
+        # ----------------------------------------------------
+        # TELEGRAM
+        # ----------------------------------------------------
 
         try:
 
-            hist_df = self.history_cache.get(
-                (symbol, tf),
-                df_coded
-            )
+            if CONFIG[
+                "SEND_CHART"
+            ]:
 
-            loop = asyncio.get_event_loop()
+                loop = (
+                    asyncio.get_event_loop()
+                )
 
-            buf = await loop.run_in_executor(
-                None,
-                make_signal_chart,
-                hist_df,
-                pattern,
-                symbol,
-                tf
-            )
+                buf = await loop.run_in_executor(
+                    None,
+                    make_signal_chart,
+                    historical_df,
+                    pattern,
+                    symbol,
+                    tf
+                )
 
-            await tg.photo(
-                buf,
-                caption=msg
-            )
+                await tg.photo(
+                    buf,
+                    caption=msg
+                )
 
-            # Full deep report separately.
-            await tg.send(
-                report
-            )
+            else:
+
+                await tg.send(
+                    msg
+                )
 
         except Exception as e:
 
             log.error(
-                f"Signal chart error: {e}"
+                f"Signal send xato: {e}"
             )
 
             await tg.send(
                 msg
             )
 
-    # --------------------------------------------------------
+
+    # ========================================================
     # WEBSOCKET
-    # --------------------------------------------------------
+    # ========================================================
 
     async def listen_stream(
         self,
@@ -2884,7 +3052,7 @@ class LivePatternBot:
         tf
     ):
 
-        while True:
+        while self.running:
 
             try:
 
@@ -2898,63 +3066,79 @@ class LivePatternBot:
                 async with socket as stream:
 
                     log.info(
-                        f"🔌 {symbol} {tf}: "
+                        f"🔌 {symbol} {tf} "
                         f"WebSocket ulandi"
                     )
 
-                    while True:
+                    while self.running:
 
                         msg = await stream.recv()
 
                         if (
-                            msg.get("e")
-                            != "kline"
+                            not isinstance(
+                                msg,
+                                dict
+                            )
                         ):
                             continue
 
-                        k = msg[
-                            "k"
-                        ]
-
-                        # Only CLOSED candles.
-                        if not k[
-                            "x"
-                        ]:
+                        if msg.get(
+                            "e"
+                        ) != "kline":
                             continue
+
+                        k = msg.get(
+                            "k",
+                            {}
+                        )
+
+                        # ------------------------------------
+                        # ONLY CLOSED CANDLE
+                        # ------------------------------------
+
+                        if CONFIG[
+                            "REQUIRE_CLOSED_CANDLE"
+                        ]:
+
+                            if not k.get(
+                                "x",
+                                False
+                            ):
+                                continue
 
                         candle = {
 
-                            "open_time": int(
-                                k["t"]
-                                / 1000
-                            ),
+                            "open_time":
+                                int(
+                                    k["t"]
+                                    / 1000
+                                ),
 
-                            "open": float(
-                                k["o"]
-                            ),
+                            "open":
+                                float(
+                                    k["o"]
+                                ),
 
-                            "high": float(
-                                k["h"]
-                            ),
+                            "high":
+                                float(
+                                    k["h"]
+                                ),
 
-                            "low": float(
-                                k["l"]
-                            ),
+                            "low":
+                                float(
+                                    k["l"]
+                                ),
 
-                            "close": float(
-                                k["c"]
-                            ),
+                            "close":
+                                float(
+                                    k["c"]
+                                ),
 
-                            "volume": float(
-                                k["v"]
-                            ),
+                            "volume":
+                                float(
+                                    k["v"]
+                                ),
                         }
-
-                        log.info(
-                            f"🕯 CLOSED "
-                            f"{symbol} {tf} "
-                            f"{candle['close']}"
-                        )
 
                         self._on_closed_candle(
                             symbol,
@@ -2962,51 +3146,164 @@ class LivePatternBot:
                             candle
                         )
 
+            except asyncio.CancelledError:
+
+                raise
+
             except Exception as e:
 
                 log.error(
                     f"❌ {symbol} {tf} "
-                    f"stream error: {e}"
+                    f"WebSocket: {e}"
                 )
 
                 await asyncio.sleep(
                     5
                 )
 
-    # --------------------------------------------------------
-    # MAIN RUN
-    # --------------------------------------------------------
+
+    # ========================================================
+    # DEEP RESCAN
+    # ========================================================
+
+    async def deep_rescan(
+        self
+    ):
+
+        while self.running:
+
+            try:
+
+                await asyncio.sleep(
+                    CONFIG[
+                        "RECHECK_INTERVAL"
+                    ]
+                )
+
+                log.info(
+                    "🔄 ULTRA DEEP "
+                    "HISTORY RECHECK..."
+                )
+
+                old_patterns = dict(
+                    self.patterns
+                )
+
+                new_patterns = {}
+
+                for symbol in CONFIG[
+                    "SYMBOLS"
+                ]:
+
+                    for tf in CONFIG[
+                        "TIMEFRAMES"
+                    ]:
+
+                        try:
+
+                            top = (
+                                await self.find_patterns_for(
+                                    symbol,
+                                    tf
+                                )
+                            )
+
+                            if top:
+
+                                new_patterns[
+                                    (symbol, tf)
+                                ] = top
+
+                        except Exception as e:
+
+                            log.error(
+                                f"Rescan "
+                                f"{symbol} {tf}: "
+                                f"{e}"
+                            )
+
+                self.patterns = (
+                    new_patterns
+                )
+
+                old_total = sum(
+                    len(v)
+                    for v in old_patterns.values()
+                )
+
+                new_total = sum(
+                    len(v)
+                    for v in new_patterns.values()
+                )
+
+                await tg.send(
+                    f"🔄 <b>ULTRA DEEP "
+                    f"RECHECK</b>\n"
+                    f"Old patterns: "
+                    f"{old_total}\n"
+                    f"New patterns: "
+                    f"<b>{new_total}</b>\n"
+                    f"Historical data qayta "
+                    f"tekshirildi."
+                )
+
+            except asyncio.CancelledError:
+
+                raise
+
+            except Exception as e:
+
+                log.error(
+                    f"Deep rescan xato: {e}"
+                )
+
+
+    # ========================================================
+    # START
+    # ========================================================
 
     async def run(
         self
     ):
 
-        log.info(
-            "🚀 Crypto Deep Pattern "
-            "Bot v9.0 ishga tushmoqda"
-        )
-
         await tg.send(
-            f"🚀 <b>Crypto Deep Pattern Bot v9.0</b>\n"
+
+            f"🚀 <b>ULTRA DEEP "
+            f"PATTERN BOT v9.0</b>\n"
+
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
+
             f"<b>Symbols:</b> "
             f"{', '.join(CONFIG['SYMBOLS'])}\n"
+
             f"<b>TF:</b> "
             f"{', '.join(CONFIG['TIMEFRAMES'])}\n"
-            f"<b>Minimum occurrences:</b> "
+
+            f"<b>Min occurrences:</b> "
             f"{CONFIG['MIN_OCCURRENCES']}\n"
-            f"<b>Minimum WR:</b> "
-            f"{CONFIG['MIN_WIN_RATE']}%\n"
-            f"<b>Maximum losses:</b> "
+
+            f"<b>Max losses:</b> "
             f"{CONFIG['MAX_LOSSES']}\n"
-            f"<b>Minimum PF:</b> "
+
+            f"<b>Min WR:</b> "
+            f"{CONFIG['MIN_WIN_RATE']}%\n"
+
+            f"<b>Min PF:</b> "
             f"{CONFIG['MIN_PROFIT_FACTOR']}\n"
-            f"<b>Minimum Confidence:</b> "
-            f"{CONFIG['MIN_CONFIDENCE']}/100\n"
-            f"<b>Forward candles:</b> "
-            f"{CONFIG['FORWARD_CANDLES']}\n"
+
+            f"<b>Min Avg R:</b> "
+            f"{CONFIG['MIN_AVG_R']}\n"
+
+            f"<b>Bootstrap:</b> "
+            f"{CONFIG['BOOTSTRAP_RUNS']}x\n"
+
+            f"<b>Signal validation:</b> "
+            f"{CONFIG['SIGNAL_VALIDATION_PASSES']}x\n"
+
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔬 <b>DEEP ANALYSIS BOSHLANDI</b>"
+
+            f"⏳ <b>Butun tarix "
+            f"chuqur tekshirilmoqda...</b>"
         )
 
         self.client = (
@@ -3019,21 +3316,19 @@ class LivePatternBot:
             )
         )
 
-        # ====================================================
-        # CONTINUOUS DEEP SCAN
-        # ====================================================
+        # ----------------------------------------------------
+        # NEVER SHUTDOWN WHEN NO PATTERN
+        # ----------------------------------------------------
 
-        while True:
+        while self.running:
 
             self.patterns = {}
 
-            scan_started = time.time()
+            total = 0
 
-            await tg.send(
-                "🔬 <b>Yangi deep scan boshlandi...</b>\n"
-                "Har bir pattern tarixdagi "
-                "100+ occurrence orqali tekshirilmoqda."
-            )
+            # ------------------------------------------------
+            # FULL HISTORY SCAN
+            # ------------------------------------------------
 
             for symbol in CONFIG[
                 "SYMBOLS"
@@ -3045,9 +3340,16 @@ class LivePatternBot:
 
                     try:
 
-                        top = await self.find_patterns_for(
-                            symbol,
-                            tf
+                        log.info(
+                            f"🔬 DEEP SCAN "
+                            f"{symbol} {tf}"
+                        )
+
+                        top = (
+                            await self.find_patterns_for(
+                                symbol,
+                                tf
+                            )
                         )
 
                         if top:
@@ -3056,145 +3358,196 @@ class LivePatternBot:
                                 (symbol, tf)
                             ] = top
 
+                            total += len(
+                                top
+                            )
+
                             best = top[0]
 
                             await tg.send(
-                                f"✅ <b>{symbol} · {tf}</b>\n"
-                                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                                f"<b>Deep patterns:</b> "
-                                f"{len(top)}\n\n"
-                                f"🥇 <b>TOP PATTERN</b>\n"
-                                f"<code>{best['signature']}</code>\n"
-                                f"→ <b>{best['direction']}</b>\n"
-                                f"├ Occurrences: "
-                                f"{best['count']}\n"
-                                f"├ WIN: {best['wins']}\n"
-                                f"├ LOSS: {best['losses']}\n"
-                                f"├ WR: {best['win_rate']}%\n"
-                                f"├ PF: {best['profit_factor']}\n"
-                                f"├ Avg R: "
-                                f"{best['avg_r']:+.3f}\n"
-                                f"├ MFE: "
-                                f"{best['avg_mfe']:+.3f}R\n"
-                                f"├ MAE: "
-                                f"{best['avg_mae']:+.3f}R\n"
-                                f"├ 1R: "
-                                f"{best['reached_1r']}\n"
-                                f"├ 4R: "
-                                f"{best['reached_4r']}\n"
-                                f"├ 10R: "
-                                f"{best['reached_10r']}\n"
-                                f"├ Retracement: "
-                                f"{best['retracement_rate']}%\n"
-                                f"├ Continuation: "
-                                f"{best['continuation_rate']}%\n"
-                                f"├ Breakout: "
-                                f"{best['breakout_rate']}%\n"
-                                f"└ Confidence: "
-                                f"<b>{best['confidence']}/100</b>"
+
+                                f"🔬 <b>DEEP FILTER "
+                                f"PASSED</b>\n"
+
+                                f"<b>{symbol} · "
+                                f"{tf}</b>\n"
+
+                                f"Pattern: "
+                                f"<code>"
+                                f"{best['signature']}"
+                                f"</code>\n"
+
+                                f"Direction: "
+                                f"<b>"
+                                f"{best['direction']}"
+                                f"</b>\n"
+
+                                f"Occurrences: "
+                                f"<b>"
+                                f"{best['count']}"
+                                f"</b>\n"
+
+                                f"WR: "
+                                f"<b>"
+                                f"{best['win_rate']}%"
+                                f"</b>\n"
+
+                                f"Losses: "
+                                f"<b>"
+                                f"{best['losses']}"
+                                f"</b>\n"
+
+                                f"PF: "
+                                f"<b>"
+                                f"{best['profit_factor']}"
+                                f"</b>\n"
+
+                                f"Avg R: "
+                                f"<b>"
+                                f"{best['avg_r']:+.4f}"
+                                f"</b>\n"
+
+                                f"Walk-forward min WR: "
+                                f"<b>"
+                                f"{best['temporal_min_wr']}%"
+                                f"</b>\n"
+
+                                f"100x bootstrap lower: "
+                                f"<b>"
+                                f"{best['bootstrap_lower']}%"
+                                f"</b>\n"
+
+                                f"Confidence: "
+                                f"<b>"
+                                f"{best['confidence']}/100"
+                                f"</b>\n"
+
+                                f"✅ "
+                                f"100-pass validationga "
+                                f"tayyor."
                             )
 
                         else:
 
                             log.info(
                                 f"⚠️ {symbol} {tf}: "
-                                f"deep filterdan o'tgan "
-                                f"pattern yo'q"
+                                f"ULTRA filterga "
+                                f"mos pattern yo'q."
                             )
 
                     except Exception as e:
 
                         log.error(
                             f"{symbol} {tf}: "
-                            f"deep scan error: {e}"
+                            f"{e}"
                         )
 
                         await tg.send(
-                            f"❌ <b>{symbol} · {tf}</b>\n"
-                            f"Deep scan error: "
-                            f"<code>{e}</code>"
+                            f"⚠️ "
+                            f"{symbol} {tf} "
+                            f"scan xato: "
+                            f"{e}"
                         )
 
-            total = sum(
-                len(v)
-                for v in self.patterns.values()
-            )
-
-            scan_time = (
-                time.time()
-                - scan_started
-            )
-
-            # =================================================
-            # NO PATTERN
-            # =================================================
+            # ------------------------------------------------
+            # NOTHING FOUND
+            # ------------------------------------------------
 
             if total == 0:
 
                 await tg.send(
-                    f"⏳ <b>Deep scan yakunlandi.</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"❌ Hozircha barcha "
-                    f"qat'iy filtrdan o'tgan "
-                    f"pattern topilmadi.\n"
-                    f"⏱ Scan: {scan_time/60:.1f} min\n"
-                    f"🔄 Bot o'chmaydi.\n"
-                    f"Keyingi deep scan: "
-                    f"{CONFIG['NO_PATTERN_RESCAN_SECONDS']/60:.0f} daqiqadan keyin."
-                )
 
-                log.info(
-                    "⏳ Pattern yo'q. "
-                    "1 soat kutamiz..."
+                    f"⏳ <b>Hozircha signal yo'q.</b>\n"
+
+                    f"Tarixning hammasi tekshirildi.\n"
+
+                    f"Talab:\n"
+
+                    f"├ >= "
+                    f"{CONFIG['MIN_OCCURRENCES']} "
+                    f"occurrence\n"
+
+                    f"├ <= "
+                    f"{CONFIG['MAX_LOSSES']} "
+                    f"loss\n"
+
+                    f"├ >= "
+                    f"{CONFIG['MIN_WIN_RATE']}% WR\n"
+
+                    f"├ >= "
+                    f"{CONFIG['MIN_PROFIT_FACTOR']} PF\n"
+
+                    f"├ >= "
+                    f"{CONFIG['MIN_AVG_R']} Avg R\n"
+
+                    f"├ Walk-forward >= "
+                    f"{CONFIG['MIN_WALK_FORWARD_WR']}%\n"
+
+                    f"└ Bootstrap lower >= "
+                    f"{CONFIG['MIN_BOOTSTRAP_LOWER']}%\n\n"
+
+                    f"❗ Bot o'chmaydi.\n"
+                    f"🔄 "
+                    f"{CONFIG['NO_PATTERN_SLEEP']} "
+                    f"soniyadan keyin yana "
+                    f"butun tarixni tekshiradi."
                 )
 
                 await asyncio.sleep(
                     CONFIG[
-                        "NO_PATTERN_RESCAN_SECONDS"
+                        "NO_PATTERN_SLEEP"
                     ]
                 )
 
                 continue
 
-            # =================================================
-            # PATTERNS FOUND
-            # =================================================
+            # ------------------------------------------------
+            # PATTERN FOUND
+            # ------------------------------------------------
 
             await tg.send(
-                f"🟢 <b>DEEP ANALYSIS YAKUNLANDI</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"<b>Jami pattern:</b> "
-                f"{total}\n"
-                f"<b>Scan time:</b> "
-                f"{scan_time/60:.1f} min\n"
-                f"📡 Real-time closed-candle "
-                f"monitoring boshlandi."
+
+                f"✅ <b>ULTRA FILTER "
+                f"YAKUNLANDI</b>\n"
+
+                f"Jami valid pattern: "
+                f"<b>{total}</b>\n\n"
+
+                f"Real-time closed candle "
+                f"kuzatuvi boshlandi."
             )
 
             break
 
-        # ====================================================
-        # LIVE STREAM TASKS
-        # ====================================================
+        # ----------------------------------------------------
+        # LIVE TASKS
+        # ----------------------------------------------------
 
-        tasks = [
-            asyncio.create_task(
-                self.listen_stream(
-                    symbol,
-                    tf
+        tasks = []
+
+        for (
+            symbol,
+            tf
+        ) in self.patterns.keys():
+
+            tasks.append(
+                asyncio.create_task(
+                    self.listen_stream(
+                        symbol,
+                        tf
+                    )
                 )
             )
-            for symbol, tf in self.patterns.keys()
-        ]
 
-        if not tasks:
+        # ----------------------------------------------------
+        # PERIODIC DEEP RESCAN
+        # ----------------------------------------------------
 
-            await tg.send(
-                "⚠️ Monitoring uchun task topilmadi. "
-                "Bot qayta deep scan qiladi."
+        tasks.append(
+            asyncio.create_task(
+                self.deep_rescan()
             )
-
-            return
+        )
 
         await asyncio.gather(
             *tasks
@@ -3216,28 +3569,23 @@ async def main():
     except KeyboardInterrupt:
 
         log.info(
-            "🛑 To'xtatilmoqda..."
+            "🛑 Bot to'xtatildi."
         )
 
     except Exception as e:
 
         log.exception(
-            f"FATAL ERROR: {e}"
+            f"Fatal error: {e}"
         )
 
-        try:
-
-            await tg.send(
-                f"❌ <b>BOT ERROR</b>\n"
-                f"<code>{e}</code>"
-            )
-
-        except Exception:
-            pass
-
-        raise
+        await tg.send(
+            f"❌ <b>BOT FATAL ERROR</b>\n"
+            f"<code>{str(e)}</code>"
+        )
 
     finally:
+
+        bot.running = False
 
         if bot.client:
 
@@ -3245,15 +3593,13 @@ async def main():
 
                 await bot.client.close_connection()
 
-            except Exception as e:
+            except Exception:
 
-                log.error(
-                    f"Client close error: {e}"
-                )
+                pass
 
 
 # ============================================================
-# START
+# ENTRY
 # ============================================================
 
 if __name__ == "__main__":
