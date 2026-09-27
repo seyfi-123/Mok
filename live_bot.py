@@ -4021,6 +4021,7 @@ def analyze_symbol(
                                         "FLAT"
                                     )
                                 )
+                            )
 
                             telegram_send_photo(
                                 chart_path,
