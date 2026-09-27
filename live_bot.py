@@ -1,8 +1,8 @@
 # ============================================================
-# Crypto Live Pattern Bot v5.0
-# - Tarixda naqsh necha marta ishlagan, grafikda belgilanadi
-# - Telegramga oddiy tushunarli xabar (foyda/zarar)
-# - Rasm har doim yuboriladi
+# Crypto Live Pattern Bot v6.0
+# - Har bir signalda: necha marta 1R, 2R, 4R, 6R, 8R, 10R ga yetgani
+# - Rasmda ham bu ma'lumot ko'rsatiladi
+# - 1:1R logika: 1R da 50% + BE, 4R dan trailing
 # ============================================================
 import os
 import json
@@ -17,6 +17,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch
 
 from binance import AsyncClient, BinanceSocketManager
 from telegram import Bot, InputFile
@@ -30,7 +31,7 @@ load_dotenv()
 # ============================================================
 CONFIG = {
     'SYMBOLS': [s.strip().upper() for s in os.getenv('SYMBOLS', 'BTCUSDT').split(',') if s.strip()],
-    'TIMEFRAMES': [t.strip() for t in os.getenv('TIMEFRAMES', '5m,15m,1h').split(',') if t.strip()],
+    'TIMEFRAMES': [t.strip() for t in os.getenv('TIMEFRAMES', '15m,30m,1h').split(',') if t.strip()],
 
     'DAYS_PER_TF': {
         '1m':  int(os.getenv('DAYS_1M', '180')),
@@ -43,7 +44,6 @@ CONFIG = {
     },
 
     'SEQ_LENGTHS': [int(x) for x in os.getenv('SEQ_LENGTHS', '2,3,4').split(',')],
-
     'MIN_OCCURRENCES': int(os.getenv('MIN_OCCURRENCES', '100')),
     'MIN_WIN_RATE':   float(os.getenv('MIN_WIN_RATE', '50')),
     'MIN_PROFIT_FACTOR': float(os.getenv('MIN_PROFIT_FACTOR', '1.0')),
@@ -51,7 +51,7 @@ CONFIG = {
     'FORWARD_CANDLES': int(os.getenv('FORWARD_CANDLES', '50')),
     'SL_BUF': float(os.getenv('SL_BUF', '10')),
 
-    # 1:1R → 1R da 50% yopiladi + BE, 4R dan trailing
+    # 1:1R → 1R da 50% + BE, 4R dan trailing
     'TP1_R': 1.0,
     'TP1_CLOSE_PCT': 0.5,
     'TRAIL_START_R': 4.0,
@@ -69,9 +69,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 
-# ============================================================
-# TELEGRAM
-# ============================================================
 class TG:
     def __init__(self, token, chat_id):
         self.bot = Bot(token=token) if token else None
@@ -176,9 +173,14 @@ def build_signatures(df_coded, seq_len):
 
 
 # ============================================================
-# 3. SIMULYATSIYA (1:1R → TP1, BE, 4R dan trailing)
+# 3. SIMULYATSIYA — endi max_r (eng yuqori R) ham qaytadi
 # ============================================================
 def simulate_forward(df, entry_idx, direction, sl_buf_cfg):
+    """
+    Qaytaradi: (final_r, max_r_reached)
+    final_r — 1:1R logika bilan yakuniy natija
+    max_r_reached — narx qancha R ga yetgan (favorable)
+    """
     h = df['high'].values
     l = df['low'].values
     c = df['close'].values
@@ -205,7 +207,11 @@ def simulate_forward(df, entry_idx, direction, sl_buf_cfg):
     tp1_hit = False
     sl = sl_init
     lock_r = 0.0
+    max_r_reached = 0.0
     max_i = min(entry_idx + CONFIG['FORWARD_CANDLES'], n - 1)
+
+    def finalize(r):
+        return (r, max_r_reached)
 
     for i in range(entry_idx + 1, max_i + 1):
         if direction == 'B':
@@ -213,9 +219,9 @@ def simulate_forward(df, entry_idx, direction, sl_buf_cfg):
                 if tp1_hit:
                     partial1 = CONFIG['TP1_CLOSE_PCT'] * CONFIG['TP1_R']
                     partial2 = (1 - CONFIG['TP1_CLOSE_PCT']) * ((sl - entry) / sl_dist)
-                    return partial1 + partial2
+                    return finalize(partial1 + partial2)
                 else:
-                    return (sl - entry) / sl_dist
+                    return finalize((sl - entry) / sl_dist)
             if not tp1_hit and h[i] >= tp1_price:
                 tp1_hit = True
                 sl = entry
@@ -225,13 +231,16 @@ def simulate_forward(df, entry_idx, direction, sl_buf_cfg):
                 if tp1_hit:
                     partial1 = CONFIG['TP1_CLOSE_PCT'] * CONFIG['TP1_R']
                     partial2 = (1 - CONFIG['TP1_CLOSE_PCT']) * ((entry - sl) / sl_dist)
-                    return partial1 + partial2
+                    return finalize(partial1 + partial2)
                 else:
-                    return (entry - sl) / sl_dist
+                    return finalize((entry - sl) / sl_dist)
             if not tp1_hit and l[i] <= tp1_price:
                 tp1_hit = True
                 sl = entry
             max_r = (entry - l[i]) / sl_dist
+
+        if max_r > max_r_reached:
+            max_r_reached = max_r
 
         if max_r >= CONFIG['TRAIL_START_R']:
             steps = int((max_r - CONFIG['TRAIL_START_R']) / CONFIG['TRAIL_STEP_R'])
@@ -247,9 +256,9 @@ def simulate_forward(df, entry_idx, direction, sl_buf_cfg):
             if tp1_hit:
                 partial1 = CONFIG['TP1_CLOSE_PCT'] * CONFIG['TP1_R']
                 partial2 = (1 - CONFIG['TP1_CLOSE_PCT']) * CONFIG['MAX_TRAIL_R']
-                return partial1 + partial2
+                return finalize(partial1 + partial2)
             else:
-                return CONFIG['MAX_TRAIL_R']
+                return finalize(CONFIG['MAX_TRAIL_R'])
 
     if direction == 'B':
         final_r = (c[max_i] - entry) / sl_dist
@@ -259,13 +268,25 @@ def simulate_forward(df, entry_idx, direction, sl_buf_cfg):
     if tp1_hit:
         partial1 = CONFIG['TP1_CLOSE_PCT'] * CONFIG['TP1_R']
         partial2 = (1 - CONFIG['TP1_CLOSE_PCT']) * final_r
-        return partial1 + partial2
-    return final_r
+        return finalize(partial1 + partial2)
+    return finalize(final_r)
 
 
 # ============================================================
-# 4. TAHLIL
+# 4. TAHLIL — R darajalari taqsimoti qo'shildi
 # ============================================================
+def compute_r_distribution(max_r_list):
+    """Necha marta 1R, 2R, 4R, 6R, 8R, 10R ga yetganini sanaydi"""
+    return {
+        'reached_1r':  int(sum(1 for m in max_r_list if m >= 1.0)),
+        'reached_2r':  int(sum(1 for m in max_r_list if m >= 2.0)),
+        'reached_4r':  int(sum(1 for m in max_r_list if m >= 4.0)),
+        'reached_6r':  int(sum(1 for m in max_r_list if m >= 6.0)),
+        'reached_8r':  int(sum(1 for m in max_r_list if m >= 8.0)),
+        'reached_10r': int(sum(1 for m in max_r_list if m >= 10.0)),
+    }
+
+
 def analyze_timeframe(df, tf_name):
     df_coded = classify_candles(df)
     n = len(df_coded)
@@ -287,11 +308,14 @@ def analyze_timeframe(df, tf_name):
 
             for direction in ['B', 'S']:
                 r_values = []
+                max_r_values = []
                 for idx in idx_list:
-                    r = simulate_forward(df_coded, idx, direction, CONFIG['SL_BUF'])
-                    if r is None:
+                    res = simulate_forward(df_coded, idx, direction, CONFIG['SL_BUF'])
+                    if res is None:
                         continue
-                    r_values.append(r)
+                    final_r, max_r = res
+                    r_values.append(final_r)
+                    max_r_values.append(max_r)
 
                 if len(r_values) < CONFIG['MIN_OCCURRENCES']:
                     continue
@@ -305,6 +329,8 @@ def analyze_timeframe(df, tf_name):
                 gross_loss = abs(r_arr[r_arr < 0].sum())
                 pf = float(gross_win / gross_loss) if gross_loss > 0 else 999.0
 
+                dist = compute_r_distribution(max_r_values)
+
                 results.append({
                     'tf': tf_name,
                     'seq_len': seq_len,
@@ -316,6 +342,7 @@ def analyze_timeframe(df, tf_name):
                     'win_rate': round(win_rate, 1),
                     'avg_r': round(avg_r, 3),
                     'profit_factor': round(pf, 2),
+                    **dist,
                 })
 
     return results
@@ -330,29 +357,23 @@ def filter_and_rank(results):
 
 
 # ============================================================
-# 5. GRAFIK — tarixdagi barcha takrorlanishlar belgilanadi
+# 5. GRAFIK — R darajalari ham ko'rsatiladi
 # ============================================================
 def make_signal_chart(df_coded, pattern, symbol, tf):
-    """
-    Grafikda:
-      - Oxirgi 120 ta sham
-      - Tarixda shu naqsh uchragan BARCHA joylar sariq strelka bilan belgilanadi
-      - Oxirgi (hozirgi) signal katta yashil/qizil strelka bilan
-    """
     seq_len = pattern['seq_len']
     sig_col = f'sig_{seq_len}'
-
-    # Tarixda shu naqsh uchragan indekslar
     all_idx = df_coded.index[df_coded[sig_col] == pattern['signature']].tolist()
 
-    # Oxirgi 120 shamni olamiz
     total = len(df_coded)
     window_start = max(0, total - 120)
     window = df_coded.iloc[window_start:].reset_index(drop=True)
     offset = window_start
     n = len(window)
 
-    fig, ax = plt.subplots(figsize=(13, 6), facecolor='#0a0b0f')
+    fig = plt.figure(figsize=(14, 7.5), facecolor='#0a0b0f')
+    # 2 qator: yuqorida grafik, pastda R taqsimoti
+    gs = fig.add_gridspec(2, 1, height_ratios=[3.2, 1.0], hspace=0.35)
+    ax = fig.add_subplot(gs[0])
     ax.set_facecolor('#0a0b0f')
 
     # Shamlar
@@ -361,38 +382,65 @@ def make_signal_chart(df_coded, pattern, symbol, tf):
         ax.plot([i, i], [row['low'], row['high']], color=c, linewidth=1, alpha=0.85)
         ax.plot([i, i], [row['open'], row['close']], color=c, linewidth=3, alpha=0.85)
 
-    # Tarixda uchragan joylar — kichik sariq strelka
-    historical_marks = 0
+    # Tarixda uchragan joylar — sariq belgilar
     for idx in all_idx:
         rel = idx - offset
         if 0 <= rel < n - 1:
-            # Naqsh tugagan joy: rel
-            y = window['high'].iloc[rel] * 1.0005
-            ax.annotate('▼', xy=(rel, y), color='#facc15', fontsize=11,
+            y = window['high'].iloc[rel] * 1.001
+            ax.annotate('▼', xy=(rel, y), color='#facc15', fontsize=10,
                         ha='center', va='bottom', alpha=0.9)
-            historical_marks += 1
             ax.axvspan(rel - seq_len + 1, rel, color='#facc15', alpha=0.05)
 
-    # Oxirgi (hozirgi) signal — katta strelka
+    # Oxirgi signal — katta strelka
     last_rel = n - 1
     arrow = '▲ BUY' if pattern['direction'] == 'BUY' else '▼ SELL'
     arrow_color = '#10b981' if pattern['direction'] == 'BUY' else '#ef4444'
     ax.annotate(arrow,
                 xy=(last_rel, window['close'].iloc[-1]),
-                xytext=(last_rel, window['high'].max() * 1.002),
-                color=arrow_color, fontsize=14, fontweight='bold', ha='center')
-    ax.axvspan(last_rel - seq_len + 1, last_rel, color=arrow_color, alpha=0.20)
+                xytext=(last_rel, window['high'].max() * 1.003),
+                color=arrow_color, fontsize=15, fontweight='bold', ha='center')
+    ax.axvspan(last_rel - seq_len + 1, last_rel, color=arrow_color, alpha=0.25)
 
     ax.set_title(
         f"{symbol} · {tf} · {pattern['signature']} · {pattern['direction']}   "
-        f"| Tarixda {pattern['count']} marta uchragan | "
-        f"Win: {pattern['wins']}  Loss: {pattern['losses']}",
+        f"| {pattern['count']} marta | Win: {pattern['wins']} | Loss: {pattern['losses']}",
         color='#e2e8f0', fontsize=11
     )
     ax.tick_params(colors='#94a3b8', labelsize=8)
     ax.grid(True, alpha=0.1, color='#ffffff')
     for sp in ax.spines.values():
         sp.set_color('#ffffff20')
+
+    # ---- Pastdagi panel: R taqsimoti ----
+    ax2 = fig.add_subplot(gs[1])
+    ax2.set_facecolor('#0a0b0f')
+    ax2.axis('off')
+
+    labels = ['1R', '2R', '4R', '6R', '8R', '10R']
+    counts = [
+        pattern.get('reached_1r', 0),
+        pattern.get('reached_2r', 0),
+        pattern.get('reached_4r', 0),
+        pattern.get('reached_6r', 0),
+        pattern.get('reached_8r', 0),
+        pattern.get('reached_10r', 0),
+    ]
+    total_c = pattern['count'] if pattern['count'] > 0 else 1
+    pcts = [c / total_c * 100 for c in counts]
+    colors = ['#3b82f6', '#22d3ee', '#10b981', '#84cc16', '#eab308', '#f97316']
+
+    bars = ax2.barh(range(len(labels)), counts, color=colors, height=0.65)
+    ax2.set_yticks(range(len(labels)))
+    ax2.set_yticklabels(labels, color='#e2e8f0', fontsize=10)
+    ax2.set_xlim(0, max(counts) * 1.25 if max(counts) > 0 else 10)
+    ax2.invert_yaxis()
+    for i, (b, c, p) in enumerate(zip(bars, counts, pcts)):
+        ax2.text(b.get_width() + max(counts) * 0.02 if max(counts) > 0 else 0.5,
+                 b.get_y() + b.get_height()/2,
+                 f"{c} marta ({p:.1f}%)",
+                 color='#e2e8f0', fontsize=9, va='center')
+    ax2.set_title("📊 Necha marta qaysi R darajasiga yetgan",
+                  color='#e2e8f0', fontsize=10)
 
     plt.tight_layout()
     buf = io.BytesIO()
@@ -410,7 +458,7 @@ class LivePatternBot:
         self.patterns = {}
         self.buffers = {}
         self.signaled = set()
-        self.history_cache = {}   # (symbol, tf) -> df_coded (grafik uchun)
+        self.history_cache = {}
         self.client = None
         self.bm = None
 
@@ -420,13 +468,9 @@ class LivePatternBot:
         if len(df) < 500:
             return []
         df_coded = classify_candles(df)
-        # Har bir seq_len uchun signature hisoblaymiz
         for seq_len in CONFIG['SEQ_LENGTHS']:
             df_coded[f'sig_{seq_len}'] = build_signatures(df_coded, seq_len)
-
-        # Grafik uchun tarixni saqlaymiz
         self.history_cache[(symbol, tf)] = df_coded
-
         results = analyze_timeframe(df, tf)
         return filter_and_rank(results)
 
@@ -465,20 +509,19 @@ class LivePatternBot:
         price = float(df_coded['close'].iloc[-1])
         log.info(f"🚨 SIGNAL: {symbol} {tf} {pattern['signature']} {pattern['direction']} @ {price}")
 
-        # FOYDA/ZARAR ni oddiy qilib yozamiz
         wins = pattern['wins']
         losses = pattern['losses']
         total = wins + losses
-        if pattern['avg_r'] > 0:
-            outcome = "✅ FOYDA"
-            outcome_emoji = "🟢"
-        else:
-            outcome = "❌ ZARAR"
-            outcome_emoji = "🔴"
 
-        # 1R lik pul miqdorini hisoblash (masalan, 100$ risk)
-        risk_example = 100
-        expected_profit = pattern['avg_r'] * risk_example
+        r1 = pattern.get('reached_1r', 0)
+        r2 = pattern.get('reached_2r', 0)
+        r4 = pattern.get('reached_4r', 0)
+        r6 = pattern.get('reached_6r', 0)
+        r8 = pattern.get('reached_8r', 0)
+        r10 = pattern.get('reached_10r', 0)
+
+        outcome = "✅ FOYDA" if pattern['avg_r'] > 0 else "❌ ZARAR"
+        expected = pattern['avg_r'] * 100  # 100$ riskda
 
         msg = (
             f"🚨 <b>YANGI SIGNAL — {symbol}</b>\n"
@@ -490,16 +533,24 @@ class LivePatternBot:
             f"<b>🔍 Naqsh:</b> <code>{pattern['signature']}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"<b>📈 TARIXIY NATIJA:</b>\n"
-            f"├ <b>Necha marta:</b> {total} marta\n"
-            f"├ <b>✅ Foyda:</b> {wins} marta\n"
-            f"├ <b>❌ Zarar:</b> {losses} marta\n"
-            f"├ <b>🏆 Win Rate:</b> {pattern['win_rate']}%\n"
-            f"└ <b>⚖️ Nisbat:</b> {wins}:{losses}\n"
+            f"├ Jami: <b>{total}</b> marta\n"
+            f"├ ✅ Foyda: <b>{wins}</b> marta\n"
+            f"├ ❌ Zarar: <b>{losses}</b> marta\n"
+            f"├ 🏆 Win Rate: <b>{pattern['win_rate']}%</b>\n"
+            f"└ ⚖️ Nisbat: <b>{wins}:{losses}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>🎯 QAYSI R DARAJASIGA YETGAN:</b>\n"
+            f"├ 1R ✅ → <b>{r1}</b> marta\n"
+            f"├ 2R ✅ → <b>{r2}</b> marta\n"
+            f"├ 4R ✅ → <b>{r4}</b> marta\n"
+            f"├ 6R ✅ → <b>{r6}</b> marta\n"
+            f"├ 8R ✅ → <b>{r8}</b> marta\n"
+            f"└ 10R ✅ → <b>{r10}</b> marta\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"<b>📊 KUTILAYOTGAN NATIJA:</b>\n"
-            f"├ <b>O'rtacha:</b> {pattern['avg_r']:+.2f}R\n"
-            f"├ <b>100$ riskda:</b> ~{expected_profit:+.0f}$\n"
-            f"└ <b>Holat:</b> {outcome_emoji} {outcome}\n"
+            f"├ O'rtacha: <b>{pattern['avg_r']:+.2f}R</b>\n"
+            f"├ 100$ riskda: ~<b>{expected:+.0f}$</b>\n"
+            f"└ Holat: {outcome}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"<b>⚙️ BOSHQARUV:</b>\n"
             f"├ 1R da 50% yopiladi + BE\n"
@@ -510,11 +561,9 @@ class LivePatternBot:
         )
 
         try:
-            # Tarixdagi barcha uchragan joylar bilan grafik
             hist_df = self.history_cache.get((symbol, tf))
             if hist_df is None:
                 hist_df = df_coded
-
             loop = asyncio.get_event_loop()
             buf = await loop.run_in_executor(None, make_signal_chart, hist_df, pattern, symbol, tf)
             await tg.photo(buf, caption=msg)
@@ -547,9 +596,9 @@ class LivePatternBot:
                 await asyncio.sleep(5)
 
     async def run(self):
-        log.info("🚀 Live Pattern Bot v5.0 ishga tushmoqda")
+        log.info("🚀 Live Pattern Bot v6.0 ishga tushmoqda")
         await tg.send(
-            f"🚀 <b>Live Pattern Bot v5.0 ishga tushdi</b>\n"
+            f"🚀 <b>Live Pattern Bot v6.0 ishga tushdi</b>\n"
             f"<b>Symbols:</b> {', '.join(CONFIG['SYMBOLS'])}\n"
             f"<b>TF:</b> {', '.join(CONFIG['TIMEFRAMES'])}\n"
             f"<b>Min takrorlanish:</b> {CONFIG['MIN_OCCURRENCES']}\n"
@@ -573,10 +622,10 @@ class LivePatternBot:
                             f"✅ <b>{symbol} · {tf}</b>: {len(top)} ta naqsh topildi.\n\n"
                             f"🥇 Eng yaxshisi:\n"
                             f"<code>{best['signature']}</code> → {best['direction']}\n"
-                            f"├ {best['count']} marta uchragan\n"
-                            f"├ ✅ Foyda: {best['wins']}\n"
-                            f"├ ❌ Zarar: {best['losses']}\n"
+                            f"├ {best['count']} marta\n"
+                            f"├ ✅ Foyda: {best['wins']} | ❌ Zarar: {best['losses']}\n"
                             f"├ WR: {best['win_rate']}%\n"
+                            f"├ 1R: {best.get('reached_1r',0)} | 4R: {best.get('reached_4r',0)} | 10R: {best.get('reached_10r',0)}\n"
                             f"└ avg: {best['avg_r']:+.2f}R"
                         )
                     else:
@@ -600,9 +649,6 @@ class LivePatternBot:
         await asyncio.gather(*tasks)
 
 
-# ============================================================
-# ISHGA TUSHIRISH
-# ============================================================
 async def main():
     bot = LivePatternBot()
     try:
