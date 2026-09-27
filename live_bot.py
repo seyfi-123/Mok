@@ -1,44 +1,96 @@
-# ============================================================
-# DEEP HISTORICAL MARKET BOT
-# Payton-style deployment: GitHub -> Railway -> Binance -> Telegram
-#
-# Тил:
-#   - Telegram ҳисоботлари: ЎЗБЕК КИРИЛЛ
-#   - Логлар: ЎЗБЕК КИРИЛЛ
-#   - Техник environment номлари: стандарт English
-#
-# Бу бот индикаторларга таянмайди.
-# Асосий манбалар:
-#   1. OHLC шамлар
-#   2. Candle anatomy
-#   3. Price Action
-#   4. Market structure
-#   5. Historical analogues
-#   6. Forward historical outcomes
-#   7. Multi-timeframe context
-#
-# ============================================================
+#!/usr/bin/env bash
+set -e
 
+mkdir -p deep-market-bot
+cd deep-market-bot
+
+cat > requirements.txt <<'REQ'
+requests==2.32.5
+websocket-client==1.8.0
+matplotlib==3.10.6
+numpy==2.3.3
+REQ
+
+cat > Dockerfile <<'DOCKER'
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates \
+       tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY bot.py .
+
+CMD ["python", "-u", "bot.py"]
+DOCKER
+
+cat > bot.py <<'PY'
 import os
 import sys
+import time
 import json
 import math
-import time
 import signal
-import asyncio
 import hashlib
+import logging
+import threading
+import traceback
 import statistics
-from dataclasses import dataclass, asdict
+import urllib.parse
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from collections import Counter, deque
-from typing import Optional, List, Dict, Tuple
+from collections import Counter, defaultdict
+from typing import List, Dict, Optional, Tuple
 
-import aiohttp
+import requests
 import numpy as np
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import websocket
 
 
 # ============================================================
-# SOZLAMALAR
+# DEEP MARKET ANALOGUE ENGINE
+# ============================================================
+#
+# НЕ ИСПОЛЬЗУЕТ КЛАССИЧЕСКИЕ ИНДИКАТОРЫ КАК ОСНОВУ:
+# RSI / MACD / Stochastic / Bollinger / EMA / SMA НЕ ИСПОЛЬЗУЮТСЯ
+# ДЛЯ ФОРМИРОВАНИЯ СИГНАЛА.
+#
+# ОСНОВА:
+# Price Action
+# Candlesticks
+# Structure
+# Context
+# Historical Analogues
+# Multi-Timeframe
+# Market Breadth
+# News/Event Context
+#
+# SIGNAL != GUARANTEE
+# Historical statistics are evidence, not certainty.
+# ============================================================
+
+
+APP_NAME = "Deep Historical Market Analogue Engine"
+VERSION = "4.0.0"
+
+
+# ============================================================
+# CONFIG
 # ============================================================
 
 BINANCE_REST = os.getenv(
@@ -48,24 +100,19 @@ BINANCE_REST = os.getenv(
 
 BINANCE_WS = os.getenv(
     "BINANCE_WS",
-    "wss://stream.binance.com:9443"
+    "wss://stream.binance.com:9443/stream"
 )
 
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN",
-    os.getenv("TELEGRAM_TOKEN", "")
-)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID",
-    ""
-)
-
+# Example:
+# BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT
 SYMBOLS = [
     x.strip().upper()
     for x in os.getenv(
         "SYMBOLS",
-        "BTCUSDT,ETHUSDT,SOLUSDT"
+        "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT"
     ).split(",")
     if x.strip()
 ]
@@ -79,198 +126,120 @@ TIMEFRAMES = [
     if x.strip()
 ]
 
+# Historical data.
+# More days = more analogues but more startup work.
+HISTORY_DAYS_5M = int(os.getenv("HISTORY_DAYS_5M", "180"))
+HISTORY_DAYS_15M = int(os.getenv("HISTORY_DAYS_15M", "365"))
+HISTORY_DAYS_1H = int(os.getenv("HISTORY_DAYS_1H", "730"))
 
-# История
-DAYS_5M = int(os.getenv("DAYS_5M", "365"))
-DAYS_15M = int(os.getenv("DAYS_15M", "730"))
-DAYS_1H = int(os.getenv("DAYS_1H", "1825"))
-
-HISTORY_LIMIT = int(
-    os.getenv("HISTORY_LIMIT", "1000")
+MAX_CANDLES_MEMORY = int(
+    os.getenv("MAX_CANDLES_MEMORY", "12000")
 )
 
-CONTEXT_CANDLES = int(
-    os.getenv("CONTEXT_CANDLES", "30")
-)
-
-FORWARD_CANDLES = int(
-    os.getenv("FORWARD_CANDLES", "50")
-)
-
-LIVE_BUFFER = int(
-    os.getenv("LIVE_BUFFER", "2000")
-)
-
-
-# Аналоглар
 MIN_ANALOGUES = int(
-    os.getenv("MIN_ANALOGUES", "30")
+    os.getenv("MIN_ANALOGUES", "100")
 )
 
-MIN_INDEPENDENT_ANALOGUES = int(
-    os.getenv("MIN_INDEPENDENT_ANALOGUES", "15")
+TARGET_ANALOGUES = int(
+    os.getenv("TARGET_ANALOGUES", "500")
 )
 
 MIN_SIMILARITY = float(
-    os.getenv("MIN_SIMILARITY", "0.68")
+    os.getenv("MIN_SIMILARITY", "0.72")
 )
 
 TOP_ANALOGUES = int(
-    os.getenv("TOP_ANALOGUES", "10")
+    os.getenv("TOP_ANALOGUES", "500")
 )
 
-ANALOGUE_SEPARATION = int(
-    os.getenv(
-        "ANALOGUE_SEPARATION",
-        str(CONTEXT_CANDLES + FORWARD_CANDLES)
-    )
+ANALOGUE_STEP = int(
+    os.getenv("ANALOGUE_STEP", "3")
 )
 
-
-# Сигнал фильтри
-SIGNAL_MIN_ANALOGUES = int(
-    os.getenv("SIGNAL_MIN_ANALOGUES", "60")
+# Number of future candles used to determine historical result.
+FORWARD_BARS = int(
+    os.getenv("FORWARD_BARS", "12")
 )
 
-SIGNAL_MIN_INDEPENDENT = int(
-    os.getenv("SIGNAL_MIN_INDEPENDENT", "30")
+# Signal cooldown.
+SIGNAL_COOLDOWN_MINUTES = int(
+    os.getenv("SIGNAL_COOLDOWN_MINUTES", "60")
 )
 
-SIGNAL_MIN_SIMILARITY = float(
-    os.getenv("SIGNAL_MIN_SIMILARITY", "0.76")
+SCAN_SECONDS = int(
+    os.getenv("SCAN_SECONDS", "300")
 )
 
-SIGNAL_DIRECTION_MIN = float(
-    os.getenv("SIGNAL_DIRECTION_MIN", "0.60")
+MARKET_SCAN_SECONDS = int(
+    os.getenv("MARKET_SCAN_SECONDS", "600")
 )
 
-SIGNAL_MOVE_MIN = float(
-    os.getenv("SIGNAL_MOVE_MIN", "0.03")
+NEWS_SCAN_SECONDS = int(
+    os.getenv("NEWS_SCAN_SECONDS", "300")
 )
 
-
-# Live режим
-RESCAN_SECONDS = int(
-    os.getenv("RESCAN_SECONDS", "3600")
+REQUEST_TIMEOUT = int(
+    os.getenv("REQUEST_TIMEOUT", "20")
 )
 
-SIGNAL_COOLDOWN_SECONDS = int(
-    os.getenv("SIGNAL_COOLDOWN_SECONDS", "1800")
+# RSS sources.
+NEWS_FEEDS = [
+    x.strip()
+    for x in os.getenv(
+        "NEWS_FEEDS",
+        "https://feeds.feedburner.com/CoinDesk"
+    ).split(",")
+    if x.strip()
+]
+
+# Set true if you want all configured symbols scanned.
+MARKET_SCANNER_ENABLED = (
+    os.getenv("MARKET_SCANNER_ENABLED", "true").lower()
+    == "true"
 )
 
-REQUEST_DELAY = float(
-    os.getenv("REQUEST_DELAY", "0.12")
+NEWS_ENABLED = (
+    os.getenv("NEWS_ENABLED", "true").lower()
+    == "true"
 )
 
-MAX_RETRIES = int(
-    os.getenv("MAX_RETRIES", "6")
+CHART_ENABLED = (
+    os.getenv("CHART_ENABLED", "true").lower()
+    == "true"
 )
 
-
-# Telegram
-SEND_STATE_UPDATES = os.getenv(
-    "SEND_STATE_UPDATES",
-    "true"
-).lower() == "true"
-
-SEND_WATCH_UPDATES = os.getenv(
-    "SEND_WATCH_UPDATES",
-    "true"
-).lower() == "true"
-
-
-# Fayllar
-RESULT_FILE = os.getenv(
-    "RESULT_FILE",
-    "deep_market_results.json"
-)
-
-DATA_DIR = os.getenv(
-    "DATA_DIR",
-    "data"
+TELEGRAM_ENABLED = (
+    os.getenv("TELEGRAM_ENABLED", "true").lower()
+    == "true"
 )
 
 
 # ============================================================
-# YORDAMCHI FUNKSIYALAR
+# LOGGING
 # ============================================================
 
-def now_utc() -> str:
-    return datetime.now(
-        timezone.utc
-    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
 
-
-def safe_float(value, default=0.0):
-    try:
-        return float(value)
-    except Exception:
-        return default
-
-
-def clamp(value, low=0.0, high=1.0):
-    return max(low, min(high, value))
-
-
-def pct(value):
-    return f"{value * 100:+.2f}%"
-
-
-def log(message: str):
-    print(
-        f"[{now_utc()}] {message}",
-        flush=True
-    )
-
-
-def timeframe_seconds(tf: str) -> int:
-    unit = tf[-1]
-    number = int(tf[:-1])
-
-    if unit == "m":
-        return number * 60
-
-    if unit == "h":
-        return number * 3600
-
-    if unit == "d":
-        return number * 86400
-
-    raise ValueError(
-        f"Noma'lum timeframe: {tf}"
-    )
-
-
-def history_days(tf: str) -> int:
-    if tf == "5m":
-        return DAYS_5M
-
-    if tf == "15m":
-        return DAYS_15M
-
-    if tf == "1h":
-        return DAYS_1H
-
-    return 365
+log = logging.getLogger(APP_NAME)
 
 
 # ============================================================
-# CANDLE
+# DATA MODEL
 # ============================================================
 
 @dataclass
 class Candle:
     open_time: int
-    close_time: int
-
     open: float
     high: float
     low: float
     close: float
     volume: float
-
-    quote_volume: float = 0.0
-    trades: int = 0
+    close_time: int
 
     @property
     def body(self):
@@ -278,1892 +247,1399 @@ class Candle:
 
     @property
     def range(self):
-        return max(
-            self.high - self.low,
-            1e-12
-        )
+        return max(self.high - self.low, 1e-12)
 
     @property
     def upper_wick(self):
-        return self.high - max(
-            self.open,
-            self.close
-        )
+        return self.high - max(self.open, self.close)
 
     @property
     def lower_wick(self):
-        return min(
-            self.open,
-            self.close
-        ) - self.low
+        return min(self.open, self.close) - self.low
 
     @property
     def direction(self):
         if self.close > self.open:
             return 1
-
         if self.close < self.open:
             return -1
-
         return 0
 
+    @property
+    def body_ratio(self):
+        return self.body / self.range
 
-# ============================================================
-# HISTORICAL ANALOGUE
-# ============================================================
+    @property
+    def upper_wick_ratio(self):
+        return self.upper_wick / self.range
+
+    @property
+    def lower_wick_ratio(self):
+        return self.lower_wick / self.range
+
 
 @dataclass
 class Analogue:
     index: int
     similarity: float
-
-    state: str
-    structure: str
-
-    final_return: float
+    direction: str
     max_up: float
     max_down: float
+    close_move: float
+    bars_to_extreme: int
 
-    first_direction: str
 
-    hit_1_down: bool
-    hit_3_down: bool
-    hit_5_down: bool
-    hit_10_down: bool
-    hit_15_down: bool
-
-    hit_1_up: bool
-    hit_3_up: bool
-    hit_5_up: bool
-    hit_10_up: bool
-    hit_15_up: bool
+@dataclass
+class NewsItem:
+    title: str
+    link: str
+    published: str
+    source: str
 
 
 # ============================================================
-# BINANCE HTTP
+# GLOBAL STATE
 # ============================================================
 
-class BinanceClient:
+STOP = False
 
-    def __init__(self):
-        self.session: Optional[aiohttp.ClientSession] = None
+DATA_LOCK = threading.RLock()
 
-    async def start(self):
+MARKET_DATA: Dict[str, Dict[str, List[Candle]]] = defaultdict(
+    lambda: defaultdict(list)
+)
 
-        if self.session is None:
-            timeout = aiohttp.ClientTimeout(
-                total=30
+LAST_SIGNAL: Dict[Tuple[str, str], Dict] = {}
+
+NEWS_CACHE: List[NewsItem] = []
+
+LAST_NEWS_SCAN = 0
+LAST_MARKET_SCAN = 0
+
+SESSION_START = time.time()
+
+
+# ============================================================
+# UTILS
+# ============================================================
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def pct(a, b):
+    if b == 0:
+        return 0.0
+    return ((a / b) - 1.0) * 100.0
+
+
+def safe_float(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def clamp(v, lo=0.0, hi=1.0):
+    return max(lo, min(hi, v))
+
+
+def mean_or_zero(values):
+    values = list(values)
+    return statistics.mean(values) if values else 0.0
+
+
+def median_or_zero(values):
+    values = list(values)
+    return statistics.median(values) if values else 0.0
+
+
+def fmt_price(price):
+    if price >= 1000:
+        return f"{price:,.2f}"
+    if price >= 1:
+        return f"{price:,.4f}"
+    return f"{price:.8f}"
+
+
+def timeframe_seconds(tf):
+    unit = tf[-1]
+    value = int(tf[:-1])
+
+    if unit == "m":
+        return value * 60
+    if unit == "h":
+        return value * 3600
+    if unit == "d":
+        return value * 86400
+
+    return 60
+
+
+def sleep_interruptible(seconds):
+    end = time.time() + seconds
+    while time.time() < end and not STOP:
+        time.sleep(min(1, end - time.time()))
+
+
+# ============================================================
+# BINANCE REST
+# ============================================================
+
+session = requests.Session()
+session.headers.update(
+    {
+        "User-Agent": "DeepHistoricalMarketEngine/4.0"
+    }
+)
+
+
+def binance_get(path, params=None, retries=5):
+    url = BINANCE_REST + path
+
+    last_error = None
+
+    for attempt in range(retries):
+        try:
+            r = session.get(
+                url,
+                params=params,
+                timeout=REQUEST_TIMEOUT,
             )
 
-            self.session = aiohttp.ClientSession(
-                timeout=timeout,
-                headers={
-                    "User-Agent":
-                        "Deep-Historical-Market-Bot/1.0"
-                }
-            )
+            if r.status_code == 200:
+                return r.json()
 
-    async def close(self):
-
-        if self.session:
-            await self.session.close()
-
-        self.session = None
-
-    async def request(
-        self,
-        path: str,
-        params: dict
-    ):
-
-        await self.start()
-
-        url = (
-            BINANCE_REST.rstrip("/")
-            + path
-        )
-
-        last_error = None
-
-        for attempt in range(MAX_RETRIES):
-
-            try:
-
-                async with self.session.get(
-                    url,
-                    params=params
-                ) as response:
-
-                    text = await response.text()
-
-                    if response.status == 200:
-                        return json.loads(text)
-
-                    last_error = (
-                        f"HTTP {response.status}: "
-                        f"{text[:500]}"
-                    )
-
-            except Exception as exc:
-
-                last_error = str(exc)
-
-            await asyncio.sleep(
-                min(
-                    2 ** attempt,
-                    10
+            if r.status_code in (418, 429, 500, 502, 503, 504):
+                wait = min(30, 2 ** attempt)
+                log.warning(
+                    "Binance HTTP %s. Retry in %ss",
+                    r.status_code,
+                    wait,
                 )
+                time.sleep(wait)
+                continue
+
+            raise RuntimeError(
+                f"Binance HTTP {r.status_code}: {r.text[:500]}"
             )
 
-        raise RuntimeError(
-            f"Binance so'rovi muvaffaqiyatsiz: "
-            f"{last_error}"
-        )
+        except Exception as exc:
+            last_error = exc
+            wait = min(30, 2 ** attempt)
+            log.warning(
+                "Binance request error: %s. Retry in %ss",
+                exc,
+                wait,
+            )
+            time.sleep(wait)
 
-    async def klines(
-        self,
-        symbol: str,
-        interval: str,
-        start_time: Optional[int] = None,
-        end_time: Optional[int] = None,
-        limit: int = 1000
-    ):
+    raise RuntimeError(
+        f"Binance request failed: {last_error}"
+    )
 
+
+def fetch_klines(symbol, interval, days):
+    """
+    Binance klines endpoint.
+    Max 1000 rows per request.
+    """
+
+    end_time = now_ms()
+    start_time = end_time - days * 86400000
+
+    all_rows = []
+
+    current = start_time
+
+    while current < end_time and not STOP:
         params = {
             "symbol": symbol,
             "interval": interval,
-            "limit": min(
-                max(limit, 1),
-                1000
-            )
+            "startTime": current,
+            "endTime": end_time,
+            "limit": 1000,
         }
 
-        if start_time is not None:
-            params["startTime"] = start_time
-
-        if end_time is not None:
-            params["endTime"] = end_time
-
-        return await self.request(
+        rows = binance_get(
             "/api/v3/klines",
-            params
-        )
-
-
-# ============================================================
-# KLINE PARSER
-# ============================================================
-
-def parse_kline(row) -> Candle:
-
-    return Candle(
-        open_time=int(row[0]),
-        open=float(row[1]),
-        high=float(row[2]),
-        low=float(row[3]),
-        close=float(row[4]),
-        volume=float(row[5]),
-        close_time=int(row[6]),
-        quote_volume=float(row[7]),
-        trades=int(row[8])
-    )
-
-
-# ============================================================
-# TARIX YUKLASH
-# ============================================================
-
-async def load_history(
-    client: BinanceClient,
-    symbol: str,
-    timeframe: str
-) -> List[Candle]:
-
-    days = history_days(timeframe)
-
-    end_ms = int(
-        time.time() * 1000
-    )
-
-    start_ms = end_ms - (
-        days * 86400 * 1000
-    )
-
-    candles = []
-
-    cursor = start_ms
-
-    log(
-        f"📥 {symbol} {timeframe}: "
-        f"{days} kunlik tarix yuklanmoqda..."
-    )
-
-    while cursor < end_ms:
-
-        rows = await client.klines(
-            symbol=symbol,
-            interval=timeframe,
-            start_time=cursor,
-            end_time=end_ms,
-            limit=HISTORY_LIMIT
+            params,
         )
 
         if not rows:
             break
 
-        batch = [
-            parse_kline(row)
-            for row in rows
-        ]
+        all_rows.extend(rows)
 
-        candles.extend(batch)
+        last_open = int(rows[-1][0])
 
-        last_close = batch[-1].close_time
+        next_current = last_open + 1
 
-        next_cursor = (
-            last_close + 1
-        )
-
-        if next_cursor <= cursor:
+        if next_current <= current:
             break
 
-        cursor = next_cursor
+        current = next_current
 
-        await asyncio.sleep(
-            REQUEST_DELAY
-        )
-
-        if len(rows) < HISTORY_LIMIT:
+        if len(rows) < 1000:
             break
 
-    # Duplicate va tartib
+        # Small delay to be polite to REST.
+        time.sleep(0.08)
+
+    candles = []
+
+    for r in all_rows:
+        try:
+            candles.append(
+                Candle(
+                    open_time=int(r[0]),
+                    open=float(r[1]),
+                    high=float(r[2]),
+                    low=float(r[3]),
+                    close=float(r[4]),
+                    volume=float(r[5]),
+                    close_time=int(r[6]),
+                )
+            )
+        except Exception:
+            continue
+
+    # Remove duplicate timestamps.
     unique = {}
 
-    for candle in candles:
-        unique[candle.open_time] = candle
+    for c in candles:
+        unique[c.open_time] = c
 
     candles = sorted(
         unique.values(),
-        key=lambda x: x.open_time
+        key=lambda x: x.open_time,
     )
 
-    # Faqat yopilgan shamlar
-    current_ms = int(
-        time.time() * 1000
-    )
+    # Do not use currently-open candle.
+    if candles:
+        current_time = now_ms()
 
-    candles = [
-        c for c in candles
-        if c.close_time <= current_ms
-    ]
+        if candles[-1].close_time > current_time:
+            candles = candles[:-1]
 
-    log(
-        f"✅ {symbol} {timeframe}: "
-        f"{len(candles):,} ta yopilgan sham olindi."
-    )
-
-    return candles
+    return candles[-MAX_CANDLES_MEMORY:]
 
 
 # ============================================================
-# PRICE ACTION
+# CANDLE PATTERNS
 # ============================================================
 
-def candle_body_ratio(c: Candle):
-    return c.body / c.range
+def candle_color(c):
+    if c.close > c.open:
+        return "BULLISH"
+    if c.close < c.open:
+        return "BEARISH"
+    return "DOJI"
 
 
-def upper_wick_ratio(c: Candle):
-    return c.upper_wick / c.range
+def pin_bar(c):
+    body = max(c.body, 1e-12)
 
-
-def lower_wick_ratio(c: Candle):
-    return c.lower_wick / c.range
-
-
-def candle_code(c: Candle) -> str:
-
-    if c.range <= 0:
-        return "DOJI"
-
-    body = candle_body_ratio(c)
-    upper = upper_wick_ratio(c)
-    lower = lower_wick_ratio(c)
-
-    if body <= 0.10:
-        body_type = "DOJI"
-
-    elif body <= 0.35:
-        body_type = "SMALL"
-
-    elif body <= 0.65:
-        body_type = "MEDIUM"
-
-    else:
-        body_type = "LARGE"
-
-    if upper >= 0.55:
-        wick = "UPPER_REJECTION"
-
-    elif lower >= 0.55:
-        wick = "LOWER_REJECTION"
-
-    elif upper >= 0.30 and lower >= 0.30:
-        wick = "BOTH_WICKS"
-
-    else:
-        wick = "NORMAL"
-
-    direction = (
-        "BULL"
-        if c.direction > 0
-        else
-        "BEAR"
-        if c.direction < 0
-        else
-        "FLAT"
+    long_lower = (
+        c.lower_wick >= body * 2.0
+        and c.lower_wick_ratio >= 0.45
     )
 
-    return (
-        f"{direction}_"
-        f"{body_type}_"
-        f"{wick}"
+    long_upper = (
+        c.upper_wick >= body * 2.0
+        and c.upper_wick_ratio >= 0.45
     )
 
+    if long_lower and c.close >= c.open:
+        return "Bullish Pin Bar"
 
-def is_pin_bar(c: Candle):
+    if long_upper and c.close <= c.open:
+        return "Bearish Pin Bar"
 
-    body = max(
-        c.body,
-        1e-12
-    )
-
-    return (
-        (
-            c.lower_wick >= body * 2.5
-            and
-            c.upper_wick <= body * 1.2
-        )
-        or
-        (
-            c.upper_wick >= body * 2.5
-            and
-            c.lower_wick <= body * 1.2
-        )
-    )
+    return None
 
 
-def is_inside_bar(
-    candles: List[Candle],
-    i: int
-):
+def engulfing(prev, cur):
+    if (
+        prev.close < prev.open
+        and cur.close > cur.open
+        and cur.open <= prev.close
+        and cur.close >= prev.open
+    ):
+        return "Bullish Engulfing"
 
-    if i < 1:
-        return False
+    if (
+        prev.close > prev.open
+        and cur.close < cur.open
+        and cur.open >= prev.close
+        and cur.close <= prev.open
+    ):
+        return "Bearish Engulfing"
 
-    a = candles[i - 1]
-    b = candles[i]
-
-    return (
-        b.high <= a.high
-        and
-        b.low >= a.low
-    )
-
-
-def is_outside_bar(
-    candles: List[Candle],
-    i: int
-):
-
-    if i < 1:
-        return False
-
-    a = candles[i - 1]
-    b = candles[i]
-
-    return (
-        b.high >= a.high
-        and
-        b.low <= a.low
-    )
+    return None
 
 
-def is_bull_engulfing(
-    candles: List[Candle],
-    i: int
-):
-
-    if i < 1:
-        return False
-
-    a = candles[i - 1]
-    b = candles[i]
-
-    return (
-        a.direction < 0
-        and
-        b.direction > 0
-        and
-        b.open <= a.close
-        and
-        b.close >= a.open
-    )
+def inside_bar(prev, cur):
+    if cur.high <= prev.high and cur.low >= prev.low:
+        return "Inside Bar"
+    return None
 
 
-def is_bear_engulfing(
-    candles: List[Candle],
-    i: int
-):
+def outside_bar(prev, cur):
+    if cur.high >= prev.high and cur.low <= prev.low:
+        return "Outside Bar"
+    return None
 
-    if i < 1:
-        return False
 
-    a = candles[i - 1]
-    b = candles[i]
+def detect_candlestick_patterns(candles):
+    if len(candles) < 3:
+        return []
 
-    return (
-        a.direction > 0
-        and
-        b.direction < 0
-        and
-        b.open >= a.close
-        and
-        b.close <= a.open
-    )
+    prev = candles[-2]
+    cur = candles[-1]
+
+    patterns = []
+
+    p = pin_bar(cur)
+    if p:
+        patterns.append(p)
+
+    p = engulfing(prev, cur)
+    if p:
+        patterns.append(p)
+
+    p = inside_bar(prev, cur)
+    if p:
+        patterns.append(p)
+
+    p = outside_bar(prev, cur)
+    if p:
+        patterns.append(p)
+
+    if cur.body_ratio > 0.70:
+        if cur.direction > 0:
+            patterns.append("Strong Bullish Candle")
+        elif cur.direction < 0:
+            patterns.append("Strong Bearish Candle")
+
+    return patterns
 
 
 # ============================================================
-# ATR-SIMILAR NORMALIZATSIYA
+# STRUCTURE
 # ============================================================
 
-def local_range(
-    candles: List[Candle],
-    i: int,
-    n: int = 20
-):
-
-    start = max(
-        0,
-        i - n + 1
-    )
-
-    values = [
-        c.range
-        for c in candles[start:i + 1]
-    ]
-
-    if not values:
-        return 0.0
-
-    return float(
-        np.median(values)
-    )
-
-
-def normalized_move(
-    candles: List[Candle],
-    i: int,
-    n: int = 20
-):
-
-    if i < 1:
-        return 0.0
-
-    base = max(
-        local_range(
-            candles,
-            i,
-            n
-        ),
-        1e-12
-    )
-
-    move = (
-        candles[i].close
-        -
-        candles[i - 1].close
-    )
-
-    return move / base
-
-
-# ============================================================
-# IMPULSE / COMPRESSION
-# ============================================================
-
-def impulse_strength(
-    candles: List[Candle],
-    i: int,
-    lookback: int = 10
-):
-
-    if i < lookback:
-        return 0.0
-
-    a = candles[
-        i - lookback
-    ].close
-
-    b = candles[i].close
-
-    move = (
-        b - a
-    ) / max(
-        abs(a),
-        1e-12
-    )
-
-    avg_range = np.mean([
-        c.range
-        for c in candles[
-            i - lookback + 1:i + 1
-        ]
-    ])
-
-    if avg_range <= 0:
-        return 0.0
-
-    return move * (
-        abs(b - a)
-        /
-        avg_range
-    )
-
-
-def compression_score(
-    candles: List[Candle],
-    i: int,
-    lookback: int = 12
-):
-
-    if i < lookback:
-        return 0.0
-
-    ranges = np.array([
-        c.range
-        for c in candles[
-            i - lookback + 1:i + 1
-        ]
-    ])
-
-    if len(ranges) < 3:
-        return 0.0
-
-    recent = np.mean(
-        ranges[-4:]
-    )
-
-    old = np.mean(
-        ranges[:4]
-    )
-
-    if old <= 0:
-        return 0.0
-
-    return clamp(
-        1.0 - recent / old
-    )
-
-
-# ============================================================
-# SWING STRUCTURE
-# ============================================================
-
-def detect_swings(
-    candles: List[Candle],
-    left: int = 2,
-    right: int = 2
-):
-
+def local_swings(candles, strength=2):
     highs = []
     lows = []
 
+    if len(candles) < strength * 2 + 1:
+        return highs, lows
+
     for i in range(
-        left,
-        len(candles) - right
+        strength,
+        len(candles) - strength
     ):
+        c = candles[i]
 
-        high = candles[i].high
-        low = candles[i].low
+        left = candles[i-strength:i]
+        right = candles[i+1:i+strength+1]
 
-        left_highs = [
-            candles[j].high
-            for j in range(
-                i - left,
-                i
-            )
-        ]
+        if all(c.high >= x.high for x in left + right):
+            highs.append((i, c.high))
 
-        right_highs = [
-            candles[j].high
-            for j in range(
-                i + 1,
-                i + right + 1
-            )
-        ]
-
-        left_lows = [
-            candles[j].low
-            for j in range(
-                i - left,
-                i
-            )
-        ]
-
-        right_lows = [
-            candles[j].low
-            for j in range(
-                i + 1,
-                i + right + 1
-            )
-        ]
-
-        if (
-            high > max(left_highs)
-            and
-            high > max(right_highs)
-        ):
-            highs.append(i)
-
-        if (
-            low < min(left_lows)
-            and
-            low < min(right_lows)
-        ):
-            lows.append(i)
+        if all(c.low <= x.low for x in left + right):
+            lows.append((i, c.low))
 
     return highs, lows
 
 
-def structure_state(
-    candles: List[Candle],
-    i: int
-):
+def structure_state(candles):
+    if len(candles) < 15:
+        return {
+            "state": "Маълумот етарли эмас",
+            "details": [],
+        }
 
-    if i < 15:
-        return "ARALASH"
-
-    subset = candles[
-        max(0, i - 80):i + 1
-    ]
-
-    highs, lows = detect_swings(
-        subset
+    highs, lows = local_swings(
+        candles[-100:],
+        strength=2,
     )
 
     if len(highs) < 2 or len(lows) < 2:
-        return "ARALASH"
-
-    h1 = subset[
-        highs[-2]
-    ].high
-
-    h2 = subset[
-        highs[-1]
-    ].high
-
-    l1 = subset[
-        lows[-2]
-    ].low
-
-    l2 = subset[
-        lows[-1]
-    ].low
-
-    if h2 > h1 and l2 > l1:
-        return "HH_HL_UP"
-
-    if h2 < h1 and l2 < l1:
-        return "LH_LL_DOWN"
-
-    if h2 > h1 and l2 < l1:
-        return "KENGAYUVCHI"
-
-    return "ARALASH"
-
-
-# ============================================================
-# M / W
-# ============================================================
-
-def detect_m_w(
-    candles: List[Candle],
-    i: int
-):
-
-    if i < 12:
-        return "YO'Q"
-
-    data = candles[
-        i - 12:i + 1
-    ]
-
-    highs = np.array([
-        c.high
-        for c in data
-    ])
-
-    lows = np.array([
-        c.low
-        for c in data
-    ])
-
-    high_peaks = []
-
-    low_peaks = []
-
-    for j in range(
-        2,
-        len(data) - 2
-    ):
-
-        if (
-            highs[j]
-            >
-            highs[j - 1]
-            and
-            highs[j]
-            >
-            highs[j + 1]
-        ):
-            high_peaks.append(j)
-
-        if (
-            lows[j]
-            <
-            lows[j - 1]
-            and
-            lows[j]
-            <
-            lows[j + 1]
-        ):
-            low_peaks.append(j)
-
-    if len(high_peaks) >= 2:
-
-        a = highs[
-            high_peaks[-2]
-        ]
-
-        b = highs[
-            high_peaks[-1]
-        ]
-
-        tolerance = (
-            max(a, b)
-            * 0.003
-        )
-
-        if abs(a - b) <= tolerance:
-            return "M"
-
-    if len(low_peaks) >= 2:
-
-        a = lows[
-            low_peaks[-2]
-        ]
-
-        b = lows[
-            low_peaks[-1]
-        ]
-
-        tolerance = (
-            max(a, b)
-            * 0.003
-        )
-
-        if abs(a - b) <= tolerance:
-            return "W"
-
-    return "YO'Q"
-
-
-# ============================================================
-# BREAKOUT / FALSE BREAKOUT / REJECTION
-# ============================================================
-
-def market_state(
-    candles: List[Candle],
-    i: int
-):
-
-    if i < 30:
-        return "MA'LUMOT YETARLI EMAS"
-
-    current = candles[i]
-
-    previous = candles[
-        i - 20:i
-    ]
-
-    high20 = max(
-        c.high
-        for c in previous
-    )
-
-    low20 = min(
-        c.low
-        for c in previous
-    )
-
-    close = current.close
-
-    structure = structure_state(
-        candles,
-        i
-    )
-
-    impulse = impulse_strength(
-        candles,
-        i
-    )
-
-    compression = compression_score(
-        candles,
-        i
-    )
-
-    upper_rejection = (
-        current.upper_wick
-        /
-        current.range
-    )
-
-    lower_rejection = (
-        current.lower_wick
-        /
-        current.range
-    )
-
-    broke_high = (
-        current.high > high20
-    )
-
-    broke_low = (
-        current.low < low20
-    )
-
-    false_up = (
-        broke_high
-        and
-        close < high20
-    )
-
-    false_down = (
-        broke_low
-        and
-        close > low20
-    )
-
-    if false_up:
-        return "YUQORIGA SOXTA TEShISH"
-
-    if false_down:
-        return "PASTGA SOXTA TEShISH"
-
-    if broke_high and close > high20:
-        return "YUQORIGA TEShISH"
-
-    if broke_low and close < low20:
-        return "PASTGA TEShISH"
-
-    if (
-        impulse > 3.0
-        and
-        upper_rejection > 0.45
-    ):
-        return "KUCHLI O'SISH + RAD ETILISH"
-
-    if (
-        impulse < -3.0
-        and
-        lower_rejection > 0.45
-    ):
-        return "KUCHLI TUSHISH + RAD ETILISH"
-
-    if compression > 0.35:
-        return "SIQILISH"
-
-    if structure == "HH_HL_UP":
-        if impulse > 1.0:
-            return "KUCHLI O'SISH IMPULSI"
-
-        return "O'SISH TUZILMASI"
-
-    if structure == "LH_LL_DOWN":
-        if impulse < -1.0:
-            return "KUCHLI TUSHISH IMPULSI"
-
-        return "TUSHISH TUZILMASI"
-
-    if abs(impulse) > 2.5:
-        if impulse > 0:
-            return "KUCHLI O'SISH IMPULSI"
-
-        return "KUCHLI TUSHISH IMPULSI"
-
-    # Range / flat
-    recent = [
-        c.close
-        for c in candles[
-            i - 20:i + 1
-        ]
-    ]
-
-    if recent:
-
-        max_price = max(recent)
-        min_price = min(recent)
-
-        width = (
-            max_price - min_price
-        ) / max(
-            current.close,
-            1e-12
-        )
-
-        if width < 0.015:
-            return "FLAT / RANGE"
-
-    return "ARALASH"
-
-
-# ============================================================
-# KONTEXT VEKTORI
-# ============================================================
-
-def context_vector(
-    candles: List[Candle],
-    i: int
-):
-
-    start = max(
-        0,
-        i - CONTEXT_CANDLES + 1
-    )
-
-    seq = candles[
-        start:i + 1
-    ]
-
-    if len(seq) < 5:
-        return None
-
-    closes = np.array([
-        c.close
-        for c in seq
-    ])
-
-    opens = np.array([
-        c.open
-        for c in seq
-    ])
-
-    highs = np.array([
-        c.high
-        for c in seq
-    ])
-
-    lows = np.array([
-        c.low
-        for c in seq
-    ])
-
-    ranges = np.maximum(
-        highs - lows,
-        1e-12
-    )
-
-    bodies = (
-        np.abs(closes - opens)
-        /
-        ranges
-    )
-
-    upper = (
-        highs
-        -
-        np.maximum(
-            opens,
-            closes
-        )
-    ) / ranges
-
-    lower = (
-        np.minimum(
-            opens,
-            closes
-        )
-        -
-        lows
-    ) / ranges
-
-    directions = np.sign(
-        closes - opens
-    )
-
-    returns = np.diff(
-        closes
-    ) / np.maximum(
-        closes[:-1],
-        1e-12
-    )
-
-    total_move = (
-        closes[-1]
-        /
-        closes[0]
-        - 1.0
-    )
-
-    positive_ratio = np.mean(
-        directions > 0
-    )
-
-    negative_ratio = np.mean(
-        directions < 0
-    )
-
-    efficiency = (
-        abs(
-            closes[-1]
-            -
-            closes[0]
-        )
-        /
-        max(
-            np.sum(
-                np.abs(
-                    np.diff(closes)
-                )
-            ),
-            1e-12
-        )
-    )
-
-    range_position = (
-        closes[-1]
-        -
-        np.min(lows)
-    ) / max(
-        np.max(highs)
-        -
-        np.min(lows),
-        1e-12
-    )
-
-    last = seq[-1]
-
-    features = [
-        total_move,
-        efficiency,
-        positive_ratio,
-        negative_ratio,
-
-        float(
-            np.mean(bodies)
-        ),
-
-        float(
-            np.mean(upper)
-        ),
-
-        float(
-            np.mean(lower)
-        ),
-
-        float(
-            bodies[-1]
-        ),
-
-        float(
-            upper[-1]
-        ),
-
-        float(
-            lower[-1]
-        ),
-
-        float(
-            directions[-1]
-        ),
-
-        float(
-            np.mean(ranges[-5:])
-            /
-            max(
-                np.mean(ranges),
-                1e-12
-            )
-        ),
-
-        float(range_position),
-
-        float(
-            impulse_strength(
-                candles,
-                i
-            )
-        ),
-
-        float(
-            compression_score(
-                candles,
-                i
-            )
-        ),
-
-        float(
-            normalized_move(
-                candles,
-                i
-            )
-        ),
-
-        float(
-            int(
-                is_pin_bar(last)
-            )
-        ),
-
-        float(
-            int(
-                is_inside_bar(
-                    candles,
-                    i
-                )
-            )
-        ),
-
-        float(
-            int(
-                is_outside_bar(
-                    candles,
-                    i
-                )
-            )
-        ),
-
-        float(
-            int(
-                is_bull_engulfing(
-                    candles,
-                    i
-                )
-            )
-        ),
-
-        float(
-            int(
-                is_bear_engulfing(
-                    candles,
-                    i
-                )
-            )
-        ),
-
-        float(
-            int(
-                detect_m_w(
-                    candles,
-                    i
-                ) == "M"
-            )
-        ),
-
-        float(
-            int(
-                detect_m_w(
-                    candles,
-                    i
-                ) == "W"
-            )
-        )
-    ]
-
-    return np.array(
-        features,
-        dtype=np.float64
-    )
-
-
-# ============================================================
-# VEKTOR O'XSHASHLIGI
-# ============================================================
-
-def vector_similarity(
-    a,
-    b
-):
-
-    if a is None or b is None:
-        return 0.0
-
-    if len(a) != len(b):
-        return 0.0
-
-    a = np.asarray(a)
-    b = np.asarray(b)
-
-    scale = np.maximum(
-        np.abs(a),
-        np.abs(b)
-    )
-
-    scale = np.maximum(
-        scale,
-        1e-6
-    )
-
-    distance = np.mean(
-        np.abs(a - b)
-        /
-        scale
-    )
-
-    similarity = math.exp(
-        -2.5 * distance
-    )
-
-    return clamp(
-        similarity
-    )
-
-
-# ============================================================
-# FORWARD NATIJA
-# ============================================================
-
-def forward_outcome(
-    candles: List[Candle],
-    i: int
-):
-
-    current = candles[i]
-
-    end = min(
-        len(candles),
-        i + 1 + FORWARD_CANDLES
-    )
-
-    future = candles[
-        i + 1:end
-    ]
-
-    if not future:
-        return None
-
-    current_price = current.close
-
-    future_closes = np.array([
-        c.close
-        for c in future
-    ])
-
-    returns = (
-        future_closes
-        /
-        current_price
-        - 1.0
-    )
-
-    max_up = float(
-        np.max(returns)
-    )
-
-    max_down = float(
-        np.min(returns)
-    )
-
-    final_return = float(
-        returns[-1]
-    )
-
-    first_direction = "FLAT"
-
-    for value in returns:
-
-        if value >= 0.003:
-            first_direction = "UP"
-            break
-
-        if value <= -0.003:
-            first_direction = "DOWN"
-            break
-
-    def reached_down(level):
-        return bool(
-            np.min(returns)
-            <= -level
-        )
-
-    def reached_up(level):
-        return bool(
-            np.max(returns)
-            >= level
-        )
-
-    return {
-        "final_return": final_return,
-
-        "max_up": max_up,
-
-        "max_down": max_down,
-
-        "first_direction":
-            first_direction,
-
-        "hit_1_down":
-            reached_down(0.01),
-
-        "hit_3_down":
-            reached_down(0.03),
-
-        "hit_5_down":
-            reached_down(0.05),
-
-        "hit_10_down":
-            reached_down(0.10),
-
-        "hit_15_down":
-            reached_down(0.15),
-
-        "hit_1_up":
-            reached_up(0.01),
-
-        "hit_3_up":
-            reached_up(0.03),
-
-        "hit_5_up":
-            reached_up(0.05),
-
-        "hit_10_up":
-            reached_up(0.10),
-
-        "hit_15_up":
-            reached_up(0.15)
-    }
-
-
-# ============================================================
-# TARIXIY INDEKS
-# ============================================================
-
-class HistoricalIndex:
-
-    def __init__(
-        self,
-        candles: List[Candle]
-    ):
-
-        self.candles = candles
-
-        self.vectors = []
-
-        self.states = []
-
-        self.structures = []
-
-        self.valid_indices = []
-
-    def build(self):
-
-        total = len(
-            self.candles
-        )
-
-        start = (
-            CONTEXT_CANDLES
-            + 5
-        )
-
-        end = (
-            total
-            -
-            FORWARD_CANDLES
-            -
-            1
-        )
-
-        log(
-            f"🧠 Тарихий индекс қурилмоқда: "
-            f"{max(0, end - start):,} та ҳолат..."
-        )
-
-        for i in range(
-            start,
-            max(start, end)
-        ):
-
-            vector = context_vector(
-                self.candles,
-                i
-            )
-
-            if vector is None:
-                continue
-
-            self.vectors.append(
-                vector
-            )
-
-            self.states.append(
-                market_state(
-                    self.candles,
-                    i
-                )
-            )
-
-            self.structures.append(
-                structure_state(
-                    self.candles,
-                    i
-                )
-            )
-
-            self.valid_indices.append(
-                i
-            )
-
-        log(
-            f"✅ Тарихий индекс тайёр: "
-            f"{len(self.valid_indices):,} та ҳолат."
-        )
-
-
-# ============================================================
-# ANALOGUE ENGINE
-# ============================================================
-
-class AnalogueEngine:
-
-    def __init__(
-        self,
-        candles: List[Candle],
-        index: HistoricalIndex
-    ):
-
-        self.candles = candles
-        self.index = index
-
-    def find(
-        self,
-        current_index: int
-    ):
-
-        current_vector = context_vector(
-            self.candles,
-            current_index
-        )
-
-        if current_vector is None:
-            return []
-
-        current_state = market_state(
-            self.candles,
-            current_index
-        )
-
-        candidates = []
-
-        for pos, historical_index in enumerate(
-            self.index.valid_indices
-        ):
-
-            # Ҳозирги ҳолатга жуда яқин даврни
-            # тарихий аналог сифатида ишлатмаймиз.
-            if abs(
-                historical_index
-                -
-                current_index
-            ) < ANALOGUE_SEPARATION:
-
-                continue
-
-            historical_vector = (
-                self.index.vectors[pos]
-            )
-
-            similarity = vector_similarity(
-                current_vector,
-                historical_vector
-            )
-
-            if similarity < MIN_SIMILARITY:
-                continue
-
-            outcome = forward_outcome(
-                self.candles,
-                historical_index
-            )
-
-            if outcome is None:
-                continue
-
-            candidates.append(
-                Analogue(
-                    index=historical_index,
-                    similarity=similarity,
-
-                    state=self.index.states[pos],
-
-                    structure=
-                        self.index.structures[pos],
-
-                    final_return=
-                        outcome[
-                            "final_return"
-                        ],
-
-                    max_up=
-                        outcome["max_up"],
-
-                    max_down=
-                        outcome["max_down"],
-
-                    first_direction=
-                        outcome[
-                            "first_direction"
-                        ],
-
-                    hit_1_down=
-                        outcome[
-                            "hit_1_down"
-                        ],
-
-                    hit_3_down=
-                        outcome[
-                            "hit_3_down"
-                        ],
-
-                    hit_5_down=
-                        outcome[
-                            "hit_5_down"
-                        ],
-
-                    hit_10_down=
-                        outcome[
-                            "hit_10_down"
-                        ],
-
-                    hit_15_down=
-                        outcome[
-                            "hit_15_down"
-                        ],
-
-                    hit_1_up=
-                        outcome[
-                            "hit_1_up"
-                        ],
-
-                    hit_3_up=
-                        outcome[
-                            "hit_3_up"
-                        ],
-
-                    hit_5_up=
-                        outcome[
-                            "hit_5_up"
-                        ],
-
-                    hit_10_up=
-                        outcome[
-                            "hit_10_up"
-                        ],
-
-                    hit_15_up=
-                        outcome[
-                            "hit_15_up"
-                        ]
-                )
-            )
-
-        candidates.sort(
-            key=lambda x:
-                x.similarity,
-            reverse=True
-        )
-
-        # Бир хил вақт зонасидаги
-        # такрорий аналогларни қисқартамиз.
-        selected = []
-
-        for candidate in candidates:
-
-            too_close = False
-
-            for old in selected:
-
-                if abs(
-                    candidate.index
-                    -
-                    old.index
-                ) < ANALOGUE_SEPARATION:
-
-                    too_close = True
-                    break
-
-            if too_close:
-                continue
-
-            selected.append(
-                candidate
-            )
-
-        return selected
-
-
-# ============================================================
-# STATISTIKA
-# ============================================================
-
-def build_statistics(
-    analogues: List[Analogue]
-):
-
-    total = len(
-        analogues
-    )
-
-    if total == 0:
         return {
-            "total": 0
+            "state": "Нейтрал структура",
+            "details": [],
         }
 
-    up = sum(
-        1
-        for a in analogues
-        if a.first_direction == "UP"
-    )
+    last_h = highs[-2:]
+    last_l = lows[-2:]
 
-    down = sum(
-        1
-        for a in analogues
-        if a.first_direction == "DOWN"
-    )
+    h1 = last_h[0][1]
+    h2 = last_h[1][1]
 
-    flat = total - up - down
+    l1 = last_l[0][1]
+    l2 = last_l[1][1]
 
-    final_returns = [
-        a.final_return
-        for a in analogues
-    ]
+    details = []
 
-    max_ups = [
-        a.max_up
-        for a in analogues
-    ]
+    if h2 > h1:
+        details.append("HH")
+    elif h2 < h1:
+        details.append("LH")
 
-    max_downs = [
-        a.max_down
-        for a in analogues
-    ]
+    if l2 > l1:
+        details.append("HL")
+    elif l2 < l1:
+        details.append("LL")
 
-    def rate(n):
-        return (
-            n / total
-            if total
-            else 0.0
-        )
+    if "HH" in details and "HL" in details:
+        state = "Кўтарилиш структураси"
 
-    def threshold_down(name):
-        return sum(
-            1
-            for a in analogues
-            if getattr(a, name)
-        )
-
-    def threshold_up(name):
-        return sum(
-            1
-            for a in analogues
-            if getattr(a, name)
-        )
-
-    return {
-
-        "total": total,
-
-        "up": up,
-        "down": down,
-        "flat": flat,
-
-        "up_rate": rate(up),
-        "down_rate": rate(down),
-        "flat_rate": rate(flat),
-
-        "median_final":
-            float(
-                np.median(
-                    final_returns
-                )
-            ),
-
-        "median_max_up":
-            float(
-                np.median(
-                    max_ups
-                )
-            ),
-
-        "median_max_down":
-            float(
-                np.median(
-                    max_downs
-                )
-            ),
-
-        "mean_final":
-            float(
-                np.mean(
-                    final_returns
-                )
-            ),
-
-        "down_1":
-            threshold_down(
-                "hit_1_down"
-            ),
-
-        "down_3":
-            threshold_down(
-                "hit_3_down"
-            ),
-
-        "down_5":
-            threshold_down(
-                "hit_5_down"
-            ),
-
-        "down_10":
-            threshold_down(
-                "hit_10_down"
-            ),
-
-        "down_15":
-            threshold_down(
-                "hit_15_down"
-            ),
-
-        "up_1":
-            threshold_up(
-                "hit_1_up"
-            ),
-
-        "up_3":
-            threshold_up(
-                "hit_3_up"
-            ),
-
-        "up_5":
-            threshold_up(
-                "hit_5_up"
-            ),
-
-        "up_10":
-            threshold_up(
-                "hit_10_up"
-            ),
-
-        "up_15":
-            threshold_up(
-                "hit_15_up"
-            )
-    }
-
-
-# ============================================================
-# SCENARIY
-# ============================================================
-
-def determine_scenario(
-    candles: List[Candle],
-    i: int,
-    statistics: dict
-):
-
-    state = market_state(
-        candles,
-        i
-    )
-
-    structure = structure_state(
-        candles,
-        i
-    )
-
-    m_w = detect_m_w(
-        candles,
-        i
-    )
-
-    down_rate = statistics.get(
-        "down_rate",
-        0
-    )
-
-    up_rate = statistics.get(
-        "up_rate",
-        0
-    )
-
-    median_final = statistics.get(
-        "median_final",
-        0
-    )
-
-    # Тарихий статистика йўналиши
-    if (
-        down_rate >= 0.60
-        and
-        abs(median_final)
-        >= SIGNAL_MOVE_MIN
-    ):
-        historical_bias = "SHORT"
-
-    elif (
-        up_rate >= 0.60
-        and
-        abs(median_final)
-        >= SIGNAL_MOVE_MIN
-    ):
-        historical_bias = "LONG"
+    elif "LH" in details and "LL" in details:
+        state = "Пасайиш структураси"
 
     else:
-        historical_bias = "NO_CLEAR_BIAS"
-
-    # Жорий Price Action
-    if "YUQORIGA" in state:
-        current_bias = "LONG"
-
-    elif "PASTGA" in state:
-        current_bias = "SHORT"
-
-    elif "O'SISH" in state:
-        current_bias = "LONG"
-
-    elif "TUSHISH" in state:
-        current_bias = "SHORT"
-
-    elif structure == "HH_HL_UP":
-        current_bias = "LONG"
-
-    elif structure == "LH_LL_DOWN":
-        current_bias = "SHORT"
-
-    else:
-        current_bias = "NEUTRAL"
+        state = "Аралаш / нейтрал структура"
 
     return {
         "state": state,
-        "structure": structure,
-        "m_w": m_w,
-        "historical_bias":
-            historical_bias,
-        "current_bias":
-            current_bias
+        "details": details,
+        "highs": last_h,
+        "lows": last_l,
     }
+
+
+# ============================================================
+# CONTEXT ANALYSIS
+# ============================================================
+
+def average_range(candles, n=20):
+    arr = candles[-n:]
+
+    if not arr:
+        return 0.0
+
+    return mean_or_zero(
+        [x.range for x in arr]
+    )
+
+
+def compression_score(candles):
+    if len(candles) < 30:
+        return 0.0
+
+    old = average_range(candles[-30:-15])
+    new = average_range(candles[-15:])
+
+    if old <= 0:
+        return 0.0
+
+    ratio = new / old
+
+    return clamp(
+        1.0 - ratio
+    )
+
+
+def impulse_info(candles):
+    if len(candles) < 10:
+        return {
+            "direction": 0,
+            "strength": 0.0,
+            "label": "Импульс аниқ эмас",
+        }
+
+    recent = candles[-6:]
+
+    move = pct(
+        recent[-1].close,
+        recent[0].open,
+    )
+
+    ranges = [
+        c.range
+        for c in recent
+    ]
+
+    avg = mean_or_zero(ranges)
+
+    last = recent[-1]
+
+    strength = (
+        abs(move) / max(
+            (avg / max(last.close, 1e-12)) * 100,
+            0.01,
+        )
+    )
+
+    if move > 1.5:
+        direction = 1
+        label = "Кучли юқори импульс"
+
+    elif move < -1.5:
+        direction = -1
+        label = "Кучли пастга импульс"
+
+    elif move > 0.5:
+        direction = 1
+        label = "Юқори ҳаракат"
+
+    elif move < -0.5:
+        direction = -1
+        label = "Пастга ҳаракат"
+
+    else:
+        direction = 0
+        label = "Импульс аниқ эмас"
+
+    return {
+        "direction": direction,
+        "strength": strength,
+        "move": move,
+        "label": label,
+    }
+
+
+def breakout_info(candles):
+    if len(candles) < 25:
+        return {
+            "type": "Йўқ",
+            "direction": 0,
+        }
+
+    recent = candles[-1]
+    box = candles[-21:-1]
+
+    high = max(c.high for c in box)
+    low = min(c.low for c in box)
+
+    if recent.close > high:
+        return {
+            "type": "Breakout юқорига",
+            "direction": 1,
+            "level": high,
+        }
+
+    if recent.close < low:
+        return {
+            "type": "Breakout пастга",
+            "direction": -1,
+            "level": low,
+        }
+
+    # False breakout detection.
+    if recent.high > high and recent.close < high:
+        return {
+            "type": "False Breakout юқорида",
+            "direction": -1,
+            "level": high,
+        }
+
+    if recent.low < low and recent.close > low:
+        return {
+            "type": "False Breakout пастда",
+            "direction": 1,
+            "level": low,
+        }
+
+    return {
+        "type": "Диапазон ичида",
+        "direction": 0,
+        "level": None,
+    }
+
+
+def rejection_info(candles):
+    if not candles:
+        return {
+            "direction": 0,
+            "label": "Йўқ",
+        }
+
+    c = candles[-1]
+
+    if (
+        c.lower_wick > c.body * 2
+        and c.lower_wick_ratio > 0.45
+    ):
+        return {
+            "direction": 1,
+            "label": "Пастдан кучли rejection",
+        }
+
+    if (
+        c.upper_wick > c.body * 2
+        and c.upper_wick_ratio > 0.45
+    ):
+        return {
+            "direction": -1,
+            "label": "Юқоридан кучли rejection",
+        }
+
+    return {
+        "direction": 0,
+        "label": "Rejection аниқ эмас",
+    }
+
+
+def exhaustion_info(candles):
+    if len(candles) < 8:
+        return {
+            "direction": 0,
+            "label": "Маълумот етарли эмас",
+        }
+
+    recent = candles[-6:]
+
+    bull = sum(
+        1 for c in recent
+        if c.direction > 0
+    )
+
+    bear = sum(
+        1 for c in recent
+        if c.direction < 0
+    )
+
+    last = recent[-1]
+
+    if bear >= 4 and last.upper_wick_ratio > 0.35:
+        return {
+            "direction": 1,
+            "label": "Пастга ҳаракатда exhaustion/rejection",
+        }
+
+    if bull >= 4 and last.lower_wick_ratio > 0.35:
+        return {
+            "direction": -1,
+            "label": "Юқори ҳаракатда exhaustion/rejection",
+        }
+
+    return {
+        "direction": 0,
+        "label": "Exhaustion аниқ эмас",
+    }
+
+
+def mw_pattern(candles):
+    if len(candles) < 30:
+        return None
+
+    segment = candles[-30:]
+
+    highs, lows = local_swings(
+        segment,
+        strength=2,
+    )
+
+    if len(highs) >= 3:
+        h = [x[1] for x in highs[-3:]]
+
+        if (
+            abs(h[0] - h[2])
+            / max(h[0], 1e-12)
+            < 0.015
+            and h[1] < h[0]
+        ):
+            return "M / Double Top эҳтимоли"
+
+    if len(lows) >= 3:
+        l = [x[1] for x in lows[-3:]]
+
+        if (
+            abs(l[0] - l[2])
+            / max(l[0], 1e-12)
+            < 0.015
+            and l[1] > l[0]
+        ):
+            return "W / Double Bottom эҳтимоли"
+
+    return None
+
+
+def build_context(candles):
+    if len(candles) < 40:
+        return None
+
+    patterns = detect_candlestick_patterns(candles)
+
+    structure = structure_state(candles)
+
+    impulse = impulse_info(candles)
+
+    breakout = breakout_info(candles)
+
+    rejection = rejection_info(candles)
+
+    exhaustion = exhaustion_info(candles)
+
+    compression = compression_score(candles)
+
+    mw = mw_pattern(candles)
+
+    current = candles[-1]
+
+    context = {
+        "price": current.close,
+        "direction": current.direction,
+        "body_ratio": current.body_ratio,
+        "upper_wick_ratio": current.upper_wick_ratio,
+        "lower_wick_ratio": current.lower_wick_ratio,
+        "compression": compression,
+        "impulse_direction": impulse["direction"],
+        "impulse_strength": impulse["strength"],
+        "breakout_direction": breakout["direction"],
+        "rejection_direction": rejection["direction"],
+        "exhaustion_direction": exhaustion["direction"],
+        "structure_state": structure["state"],
+        "structure_details": structure["details"],
+        "patterns": patterns,
+        "mw": mw or "",
+        "range_pct": (
+            current.range
+            / max(current.close, 1e-12)
+            * 100
+        ),
+    }
+
+    return context
+
+
+# ============================================================
+# CONTEXT VECTOR
+# ============================================================
+
+def context_vector(c):
+    """
+    Indicator-free structural vector.
+
+    It describes:
+    candle body/wicks,
+    direction,
+    compression,
+    impulse,
+    breakout,
+    rejection,
+    exhaustion,
+    structure.
+    """
+
+    if not c:
+        return np.zeros(18, dtype=float)
+
+    structure_up = (
+        1.0
+        if c["structure_state"]
+        == "Кўтарилиш структураси"
+        else 0.0
+    )
+
+    structure_down = (
+        1.0
+        if c["structure_state"]
+        == "Пасайиш структураси"
+        else 0.0
+    )
+
+    return np.array(
+        [
+            c["direction"],
+            c["body_ratio"],
+            c["upper_wick_ratio"],
+            c["lower_wick_ratio"],
+            c["compression"],
+            c["impulse_direction"],
+            math.tanh(c["impulse_strength"] / 3),
+            c["breakout_direction"],
+            c["rejection_direction"],
+            c["exhaustion_direction"],
+            structure_up,
+            structure_down,
+            1.0 if "Pin Bar" in " ".join(c["patterns"]) else 0.0,
+            1.0 if "Engulfing" in " ".join(c["patterns"]) else 0.0,
+            1.0 if "Inside Bar" in " ".join(c["patterns"]) else 0.0,
+            1.0 if "Outside Bar" in " ".join(c["patterns"]) else 0.0,
+            1.0 if "Breakout" in " ".join(c["patterns"]) else 0.0,
+            c["range_pct"] / 5.0,
+        ],
+        dtype=float,
+    )
+
+
+def cosine_similarity(a, b):
+    a_norm = np.linalg.norm(a)
+    b_norm = np.linalg.norm(b)
+
+    if a_norm == 0 or b_norm == 0:
+        return 0.0
+
+    value = float(
+        np.dot(a, b)
+        / (a_norm * b_norm)
+    )
+
+    return clamp(
+        (value + 1.0) / 2.0
+    )
+
+
+# ============================================================
+# HISTORICAL ANALOGUE ENGINE
+# ============================================================
+
+class HistoricalEngine:
+
+    def __init__(self):
+        self.cache = {}
+
+    def build_index(
+        self,
+        symbol,
+        timeframe,
+        candles,
+    ):
+        """
+        Build compact historical context index.
+
+        We deliberately sample contexts to avoid
+        calculating every single candle on huge histories.
+        """
+
+        key = (symbol, timeframe)
+
+        vectors = []
+        positions = []
+
+        n = len(candles)
+
+        start = 45
+        end = n - FORWARD_BARS - 1
+
+        for i in range(
+            start,
+            end,
+            max(1, ANALOGUE_STEP),
+        ):
+
+            # Context ending at i.
+            sample = candles[
+                i - 80:i + 1
+            ]
+
+            context = build_context(sample)
+
+            if not context:
+                continue
+
+            vec = context_vector(context)
+
+            vectors.append(vec)
+            positions.append(i)
+
+        self.cache[key] = {
+            "vectors": np.asarray(
+                vectors,
+                dtype=np.float32,
+            ),
+            "positions": np.asarray(
+                positions,
+                dtype=np.int32,
+            ),
+        }
+
+        log.info(
+            "Historical index %s %s: %s contexts",
+            symbol,
+            timeframe,
+            len(positions),
+        )
+
+    def search(
+        self,
+        symbol,
+        timeframe,
+        candles,
+        current_context,
+    ):
+
+        key = (symbol, timeframe)
+
+        if key not in self.cache:
+            self.build_index(
+                symbol,
+                timeframe,
+                candles,
+            )
+
+        idx = self.cache[key]
+
+        vectors = idx["vectors"]
+        positions = idx["positions"]
+
+        if len(vectors) == 0:
+            return []
+
+        current_vector = context_vector(
+            current_context
+        )
+
+        # Vectorized cosine similarity.
+        norms = np.linalg.norm(
+            vectors,
+            axis=1,
+        )
+
+        current_norm = np.linalg.norm(
+            current_vector
+        )
+
+        if current_norm == 0:
+            return []
+
+        dots = vectors @ current_vector
+
+        sims = dots / (
+            np.maximum(norms, 1e-12)
+            * current_norm
+        )
+
+        sims = (sims + 1.0) / 2.0
+
+        candidate_indices = np.where(
+            sims >= MIN_SIMILARITY
+        )[0]
+
+        if len(candidate_indices) == 0:
+            # Take nearest cases even if threshold is not met.
+            order = np.argsort(sims)[::-1]
+
+            candidate_indices = order[
+                :min(
+                    TARGET_ANALOGUES,
+                    len(order),
+                )
+            ]
+
+        else:
+            order = candidate_indices[
+                np.argsort(
+                    sims[candidate_indices]
+                )[::-1]
+            ]
+
+            candidate_indices = order[
+                :TOP_ANALOGUES
+            ]
+
+        analogues = []
+
+        for j in candidate_indices:
+
+            i = int(
+                positions[j]
+            )
+
+            if i + FORWARD_BARS >= len(candles):
+                continue
+
+            base = candles[i].close
+
+            future = candles[
+                i + 1:
+                i + FORWARD_BARS + 1
+            ]
+
+            if not future:
+                continue
+
+            max_up = max(
+                pct(x.high, base)
+                for x in future
+            )
+
+            max_down = min(
+                pct(x.low, base)
+                for x in future
+            )
+
+            close_move = pct(
+                future[-1].close,
+                base,
+            )
+
+            if (
+                max_down <= -0.30
+                and abs(max_down) > max_up
+            ):
+                direction = "DOWN"
+
+            elif (
+                max_up >= 0.30
+                and max_up > abs(max_down)
+            ):
+                direction = "UP"
+
+            else:
+                direction = "FLAT"
+
+            if direction == "DOWN":
+                target = max_down
+            elif direction == "UP":
+                target = max_up
+            else:
+                target = abs(close_move)
+
+            bars_to_extreme = 0
+
+            if direction == "DOWN":
+                extreme = min(
+                    range(len(future)),
+                    key=lambda k: future[k].low,
+                )
+                bars_to_extreme = extreme + 1
+
+            elif direction == "UP":
+                extreme = max(
+                    range(len(future)),
+                    key=lambda k: future[k].high,
+                )
+                bars_to_extreme = extreme + 1
+
+            analogues.append(
+                Analogue(
+                    index=i,
+                    similarity=float(sims[j]),
+                    direction=direction,
+                    max_up=max_up,
+                    max_down=max_down,
+                    close_move=close_move,
+                    bars_to_extreme=bars_to_extreme,
+                )
+            )
+
+        analogues.sort(
+            key=lambda x: x.similarity,
+            reverse=True,
+        )
+
+        return analogues[:TOP_ANALOGUES]
+
+
+HISTORICAL = HistoricalEngine()
+
+
+# ============================================================
+# STATISTICS
+# ============================================================
+
+def analogue_statistics(analogues):
+
+    total = len(analogues)
+
+    if total == 0:
+        return {
+            "total": 0,
+            "up": 0,
+            "down": 0,
+            "flat": 0,
+            "up_pct": 0,
+            "down_pct": 0,
+            "flat_pct": 0,
+            "median_move": 0,
+            "median_up": 0,
+            "median_down": 0,
+            "targets": {},
+            "avg_similarity": 0,
+        }
+
+    up = [
+        x for x in analogues
+        if x.direction == "UP"
+    ]
+
+    down = [
+        x for x in analogues
+        if x.direction == "DOWN"
+    ]
+
+    flat = [
+        x for x in analogues
+        if x.direction == "FLAT"
+    ]
+
+    all_moves = [
+        x.close_move
+        for x in analogues
+    ]
+
+    target_levels = [
+        -1,
+        -3,
+        -5,
+        -10,
+        -15,
+        1,
+        3,
+        5,
+        10,
+        15,
+    ]
+
+    targets = {}
+
+    for level in target_levels:
+
+        if level < 0:
+            hits = sum(
+                1
+                for x in analogues
+                if x.max_down <= level
+            )
+        else:
+            hits = sum(
+                1
+                for x in analogues
+                if x.max_up >= level
+            )
+
+        targets[level] = {
+            "count": hits,
+            "pct": hits / total * 100,
+        }
+
+    return {
+        "total": total,
+        "up": len(up),
+        "down": len(down),
+        "flat": len(flat),
+        "up_pct": len(up) / total * 100,
+        "down_pct": len(down) / total * 100,
+        "flat_pct": len(flat) / total * 100,
+        "median_move": median_or_zero(
+            all_moves
+        ),
+        "median_up": median_or_zero(
+            [x.max_up for x in up]
+        ),
+        "median_down": median_or_zero(
+            [x.max_down for x in down]
+        ),
+        "targets": targets,
+        "avg_similarity": mean_or_zero(
+            [x.similarity for x in analogues]
+        ),
+    }
+
+
+# ============================================================
+# SCENARIO ENGINE
+# ============================================================
+
+def price_action_bias(context):
+
+    score = 0.0
+
+    score += (
+        context["impulse_direction"]
+        * min(
+            2.0,
+            context["impulse_strength"]
+        )
+    )
+
+    score += (
+        context["breakout_direction"]
+        * 1.5
+    )
+
+    score += (
+        context["rejection_direction"]
+        * 1.0
+    )
+
+    # Exhaustion is reversal evidence.
+    score += (
+        context["exhaustion_direction"]
+        * 1.2
+    )
+
+    if (
+        context["structure_state"]
+        == "Кўтарилиш структураси"
+    ):
+        score += 2.0
+
+    elif (
+        context["structure_state"]
+        == "Пасайиш структураси"
+    ):
+        score -= 2.0
+
+    if score >= 2.0:
+        return "UP"
+
+    if score <= -2.0:
+        return "DOWN"
+
+    return "FLAT"
+
+
+def historical_bias(stats):
+
+    if stats["total"] < 30:
+        return "FLAT"
+
+    if (
+        stats["down_pct"]
+        > stats["up_pct"] + 8
+    ):
+        return "DOWN"
+
+    if (
+        stats["up_pct"]
+        > stats["down_pct"] + 8
+    ):
+        return "UP"
+
+    return "FLAT"
+
+
+def scenario_score(
+    pa_bias,
+    hist_bias,
+    stats,
+):
+
+    score = 0
+
+    if pa_bias == hist_bias:
+        score += 2
+
+    if (
+        stats["total"]
+        >= MIN_ANALOGUES
+    ):
+        score += 1
+
+    if (
+        stats["avg_similarity"]
+        >= 0.80
+    ):
+        score += 1
+
+    if (
+        max(
+            stats["up_pct"],
+            stats["down_pct"],
+        )
+        >= 60
+    ):
+        score += 1
+
+    return score
+
+
+# ============================================================
+# MULTI TIMEFRAME
+# ============================================================
+
+def analyze_timeframe(
+    symbol,
+    timeframe,
+    candles,
+):
+
+    if len(candles) < 120:
+        return {
+            "ready": False,
+            "timeframe": timeframe,
+        }
+
+    current_context = build_context(
+        candles
+    )
+
+    if not current_context:
+        return {
+            "ready": False,
+            "timeframe": timeframe,
+        }
+
+    analogues = HISTORICAL.search(
+        symbol,
+        timeframe,
+        candles,
+        current_context,
+    )
+
+    stats = analogue_statistics(
+        analogues
+    )
+
+    pa_bias = price_action_bias(
+        current_context
+    )
+
+    hist_bias = historical_bias(
+        stats
+    )
+
+    combined = (
+        pa_bias
+        if pa_bias == hist_bias
+        else "FLAT"
+    )
+
+    return {
+        "ready": True,
+        "timeframe": timeframe,
+        "price": candles[-1].close,
+        "context": current_context,
+        "analogues": analogues,
+        "stats": stats,
+        "pa_bias": pa_bias,
+        "hist_bias": hist_bias,
+        "combined": combined,
+    }
+
+
+def multi_timeframe_analysis(
+    symbol
+):
+
+    results = {}
+
+    with DATA_LOCK:
+        data = {
+            tf: list(
+                MARKET_DATA[
+                    symbol
+                ][tf]
+            )
+            for tf in TIMEFRAMES
+        }
+
+    for tf, candles in data.items():
+
+        try:
+            results[tf] = analyze_timeframe(
+                symbol,
+                tf,
+                candles,
+            )
+        except Exception:
+            log.exception(
+                "Timeframe analysis failed %s %s",
+                symbol,
+                tf,
+            )
+
+    return results
 
 
 # ============================================================
@@ -2171,1413 +1647,1802 @@ def determine_scenario(
 # ============================================================
 
 def signal_gate(
-    analogues: List[Analogue],
-    statistics: dict
+    symbol,
+    mtf,
 ):
 
-    total = len(
-        analogues
-    )
+    ready = [
+        x for x in mtf.values()
+        if x.get("ready")
+    ]
 
-    if total < SIGNAL_MIN_ANALOGUES:
+    if not ready:
+        return {
+            "status": "WAIT",
+            "direction": "FLAT",
+            "reason": "Маълумот етарли эмас",
+        }
+
+    directions = [
+        x["combined"]
+        for x in ready
+        if x["combined"] in ("UP", "DOWN")
+    ]
+
+    if not directions:
         return {
             "status": "WATCH",
-            "direction": None,
-            "reason":
-                f"Тарихий аналоглар {total} та. "
-                f"Камида {SIGNAL_MIN_ANALOGUES} та керак."
+            "direction": "FLAT",
+            "reason": "Тарихий ва жорий контекст бир томонга бирлашмади",
         }
 
-    independent = min(
-        total,
-        max(
-            0,
-            total // 2
-        )
-    )
+    counts = Counter(directions)
 
-    if independent < SIGNAL_MIN_INDEPENDENT:
+    direction, count = counts.most_common(1)[0]
 
+    agreement = count / len(ready)
+
+    selected = [
+        x for x in ready
+        if x["combined"] == direction
+    ]
+
+    if not selected:
         return {
             "status": "WATCH",
-            "direction": None,
-            "reason":
-                "Мустақил тарихий ҳолатлар "
-                "ҳали етарли эмас."
+            "direction": "FLAT",
+            "reason": "Тасдиқ йўқ",
         }
 
-    best_similarity = max(
-        a.similarity
-        for a in analogues
+    avg_hist = mean_or_zero(
+        [
+            x["stats"]["down_pct"]
+            if direction == "DOWN"
+            else x["stats"]["up_pct"]
+            for x in selected
+        ]
     )
 
+    avg_similarity = mean_or_zero(
+        [
+            x["stats"]["avg_similarity"]
+            for x in selected
+        ]
+    )
+
+    avg_analogues = mean_or_zero(
+        [
+            x["stats"]["total"]
+            for x in selected
+        ]
+    )
+
+    # Strong confirmation.
     if (
-        best_similarity
-        <
-        SIGNAL_MIN_SIMILARITY
+        agreement >= 0.66
+        and avg_hist >= 60
+        and avg_similarity >= 0.76
+        and avg_analogues >= MIN_ANALOGUES
     ):
+        status = "SIGNAL"
 
-        return {
-            "status": "WATCH",
-            "direction": None,
-            "reason":
-                "Энг яхши тарихий ўхшашлик "
-                "сигнал чегарасидан паст."
-        }
-
-    up_rate = statistics.get(
-        "up_rate",
-        0
-    )
-
-    down_rate = statistics.get(
-        "down_rate",
-        0
-    )
-
-    median_final = statistics.get(
-        "median_final",
-        0
-    )
-
-    if (
-        down_rate
-        >= SIGNAL_DIRECTION_MIN
-        and
-        median_final
-        <= -SIGNAL_MOVE_MIN
+    elif (
+        avg_hist >= 55
+        and avg_analogues >= 50
     ):
+        status = "CONFIRMATION"
 
-        return {
-            "status": "SHORT_WATCH",
-            "direction": "SHORT",
-            "reason":
-                "Тарихий аналогларда пастга "
-                "йўналиш устун."
-        }
-
-    if (
-        up_rate
-        >= SIGNAL_DIRECTION_MIN
-        and
-        median_final
-        >= SIGNAL_MOVE_MIN
-    ):
-
-        return {
-            "status": "LONG_WATCH",
-            "direction": "LONG",
-            "reason":
-                "Тарихий аналогларда юқорига "
-                "йўналиш устун."
-        }
+    else:
+        status = "WATCH"
 
     return {
-        "status": "WATCH",
-        "direction": None,
-        "reason":
-            "Тарихий маълумотда аниқ "
-            "йўналиш устунлиги йўқ."
+        "status": status,
+        "direction": direction,
+        "agreement": agreement,
+        "avg_hist": avg_hist,
+        "avg_similarity": avg_similarity,
+        "avg_analogues": avg_analogues,
+        "reason": (
+            f"{count}/{len(ready)} timeframe бир томонга мос"
+        ),
     }
 
 
 # ============================================================
-# TELEGRAM MATN
+# MARKET SCANNER
 # ============================================================
 
-def make_report(
-    symbol: str,
-    timeframe: str,
-    candles: List[Candle],
-    current_index: int,
-    analogues: List[Analogue]
+def quick_market_state(candles):
+
+    if len(candles) < 20:
+        return "UNKNOWN"
+
+    context = build_context(
+        candles
+    )
+
+    if not context:
+        return "UNKNOWN"
+
+    return price_action_bias(
+        context
+    )
+
+
+def market_scanner():
+
+    result = {}
+
+    with DATA_LOCK:
+
+        for symbol in SYMBOLS:
+
+            result[symbol] = {}
+
+            for tf in TIMEFRAMES:
+
+                candles = MARKET_DATA[
+                    symbol
+                ][tf]
+
+                if candles:
+                    result[symbol][tf] = (
+                        quick_market_state(
+                            candles
+                        )
+                    )
+                else:
+                    result[symbol][tf] = "UNKNOWN"
+
+    return result
+
+
+def market_breadth(scanner):
+
+    values = []
+
+    for symbol_data in scanner.values():
+        # Use 15m if available,
+        # otherwise first timeframe.
+        state = symbol_data.get(
+            "15m"
+        )
+
+        if state is None:
+            state = next(
+                iter(
+                    symbol_data.values()
+                ),
+                "UNKNOWN",
+            )
+
+        if state in (
+            "UP",
+            "DOWN",
+            "FLAT",
+        ):
+            values.append(state)
+
+    total = len(values)
+
+    if total == 0:
+        return {
+            "up": 0,
+            "down": 0,
+            "flat": 0,
+        }
+
+    return {
+        "up": sum(
+            x == "UP"
+            for x in values
+        ) / total * 100,
+        "down": sum(
+            x == "DOWN"
+            for x in values
+        ) / total * 100,
+        "flat": sum(
+            x == "FLAT"
+            for x in values
+        ) / total * 100,
+    }
+
+
+# ============================================================
+# NEWS / EVENT ENGINE
+# ============================================================
+
+def strip_xml(text):
+    if not text:
+        return ""
+
+    return (
+        text.replace(
+            "<![CDATA[",
+            "",
+        )
+        .replace(
+            "]]>",
+            "",
+        )
+        .strip()
+    )
+
+
+def parse_rss(url):
+
+    try:
+
+        r = session.get(
+            url,
+            timeout=REQUEST_TIMEOUT,
+            headers={
+                "User-Agent":
+                "Mozilla/5.0 DeepMarketBot"
+            },
+        )
+
+        if r.status_code != 200:
+            return []
+
+        root = ET.fromstring(
+            r.content
+        )
+
+        items = []
+
+        for item in root.iter():
+
+            if (
+                item.tag.lower().endswith(
+                    "item"
+                )
+            ):
+
+                title = ""
+                link = ""
+                published = ""
+
+                for child in list(item):
+
+                    tag = child.tag.lower()
+
+                    if tag.endswith("title"):
+                        title = strip_xml(
+                            child.text
+                        )
+
+                    elif tag.endswith("link"):
+                        link = (
+                            child.text
+                            or ""
+                        ).strip()
+
+                    elif (
+                        tag.endswith(
+                            "pubdate"
+                        )
+                        or tag.endswith(
+                            "published"
+                        )
+                        or tag.endswith(
+                            "updated"
+                        )
+                    ):
+                        published = (
+                            child.text
+                            or ""
+                        ).strip()
+
+                if title:
+                    items.append(
+                        NewsItem(
+                            title=title,
+                            link=link,
+                            published=published,
+                            source=url,
+                        )
+                    )
+
+        return items[:30]
+
+    except Exception as exc:
+        log.warning(
+            "RSS error %s: %s",
+            url,
+            exc,
+        )
+        return []
+
+
+def refresh_news():
+
+    global NEWS_CACHE
+    global LAST_NEWS_SCAN
+
+    all_items = []
+
+    for feed in NEWS_FEEDS:
+        all_items.extend(
+            parse_rss(feed)
+        )
+
+    # Deduplicate.
+    seen = set()
+    final = []
+
+    for item in all_items:
+
+        key = (
+            item.title.lower().strip()
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        final.append(item)
+
+    NEWS_CACHE = final[:100]
+
+    LAST_NEWS_SCAN = time.time()
+
+    log.info(
+        "News cache updated: %s items",
+        len(NEWS_CACHE),
+    )
+
+
+def relevant_news(symbol):
+
+    if not NEWS_CACHE:
+        return []
+
+    base = symbol.replace(
+        "USDT",
+        "",
+    ).upper()
+
+    keywords = {
+        base,
+        "BITCOIN"
+        if base == "BTC"
+        else "",
+        "ETHEREUM"
+        if base == "ETH"
+        else "",
+        "CRYPTO",
+        "BINANCE",
+        "FED",
+        "ETF",
+        "SEC",
+        "RATE",
+        "INFLATION",
+        "CPI",
+        "FOMC",
+        "REGULATION",
+    }
+
+    keywords = {
+        x.lower()
+        for x in keywords
+        if x
+    }
+
+    result = []
+
+    for item in NEWS_CACHE:
+
+        text = item.title.lower()
+
+        if any(
+            k in text
+            for k in keywords
+        ):
+            result.append(item)
+
+    return result[:5]
+
+
+# ============================================================
+# CHART ENGINE
+# ============================================================
+
+def make_chart(
+    symbol,
+    timeframe,
+    candles,
+    analysis,
+    path,
 ):
 
-    current = candles[
-        current_index
-    ]
+    if not candles:
+        return None
 
-    state = market_state(
-        candles,
-        current_index
+    data = candles[-80:]
+
+    fig, ax = plt.subplots(
+        figsize=(13, 7)
     )
 
-    structure = structure_state(
-        candles,
-        current_index
+    x = np.arange(
+        len(data)
     )
 
-    m_w = detect_m_w(
-        candles,
-        current_index
-    )
+    for i, c in enumerate(data):
 
-    statistics = build_statistics(
-        analogues
-    )
+        if c.close >= c.open:
+            color = "green"
+        else:
+            color = "red"
 
-    scenario = determine_scenario(
-        candles,
-        current_index,
-        statistics
-    )
-
-    gate = signal_gate(
-        analogues,
-        statistics
-    )
-
-    total = statistics.get(
-        "total",
-        0
-    )
-
-    def percent_count(
-        count
-    ):
-
-        if total == 0:
-            return "0.0%"
-
-        return (
-            f"{count / total * 100:.1f}%"
+        ax.plot(
+            [i, i],
+            [c.low, c.high],
+            color=color,
+            linewidth=1,
         )
 
-    lines = []
-
-    lines.append(
-        "🔥 CHUQUR PRICE ACTION TAHLILI"
-    )
-
-    lines.append("")
-    lines.append(
-        f"💰 {symbol}"
-    )
-
-    lines.append(
-        f"⏱ TF: {timeframe}"
-    )
-
-    lines.append(
-        f"💵 Narx: {current.close:.8f}"
-    )
-
-    lines.append(
-        f"🕯 Sham: {candle_code(current)}"
-    )
-
-    lines.append("")
-
-    lines.append(
-        "━━━━━━━━━━━━━━━━━━"
-    )
-
-    lines.append(
-        "📊 HOZIRGI BOZOR HOLATI"
-    )
-
-    lines.append(
-        f"Holat: {state}"
-    )
-
-    lines.append(
-        f"Tuzilma: {structure}"
-    )
-
-    lines.append(
-        f"M/W: {m_w}"
-    )
-
-    lines.append(
-        f"Pin Bar: "
-        f"{'HA' if is_pin_bar(current) else 'YO‘Q'}"
-    )
-
-    lines.append(
-        f"Inside Bar: "
-        f"{'HA' if is_inside_bar(candles, current_index) else 'YO‘Q'}"
-    )
-
-    lines.append(
-        f"Outside Bar: "
-        f"{'HA' if is_outside_bar(candles, current_index) else 'YO‘Q'}"
-    )
-
-    lines.append("")
-
-    lines.append(
-        "━━━━━━━━━━━━━━━━━━"
-    )
-
-    lines.append(
-        "🧠 TARIXIY ANALOGIYALAR"
-    )
-
-    lines.append(
-        f"Topilgan holatlar: {total}"
-    )
-
-    if total:
-
-        lines.append(
-            f"🟢 Yuqoriga: "
-            f"{statistics['up']} "
-            f"({statistics['up_rate'] * 100:.1f}%)"
+        ax.plot(
+            [i, i],
+            [c.open, c.close],
+            color=color,
+            linewidth=5,
         )
 
-        lines.append(
-            f"🔴 Pastga: "
-            f"{statistics['down']} "
-            f"({statistics['down_rate'] * 100:.1f}%)"
-        )
-
-        lines.append(
-            f"⚪ Tekis: "
-            f"{statistics['flat']} "
-            f"({statistics['flat_rate'] * 100:.1f}%)"
-        )
-
-        lines.append("")
-
-        lines.append(
-            "📉 TARIXIY HARAKAT"
-        )
-
-        lines.append(
-            f"-1%: "
-            f"{statistics['down_1']} "
-            f"({percent_count(statistics['down_1'])})"
-        )
-
-        lines.append(
-            f"-3%: "
-            f"{statistics['down_3']} "
-            f"({percent_count(statistics['down_3'])})"
-        )
-
-        lines.append(
-            f"-5%: "
-            f"{statistics['down_5']} "
-            f"({percent_count(statistics['down_5'])})"
-        )
-
-        lines.append(
-            f"-10%: "
-            f"{statistics['down_10']} "
-            f"({percent_count(statistics['down_10'])})"
-        )
-
-        lines.append(
-            f"-15%: "
-            f"{statistics['down_15']} "
-            f"({percent_count(statistics['down_15'])})"
-        )
-
-        lines.append("")
-
-        lines.append(
-            "📈 YUQORIGA HARAKAT"
-        )
-
-        lines.append(
-            f"+1%: "
-            f"{statistics['up_1']} "
-            f"({percent_count(statistics['up_1'])})"
-        )
-
-        lines.append(
-            f"+3%: "
-            f"{statistics['up_3']} "
-            f"({percent_count(statistics['up_3'])})"
-        )
-
-        lines.append(
-            f"+5%: "
-            f"{statistics['up_5']} "
-            f"({percent_count(statistics['up_5'])})"
-        )
-
-        lines.append(
-            f"+10%: "
-            f"{statistics['up_10']} "
-            f"({percent_count(statistics['up_10'])})"
-        )
-
-        lines.append(
-            f"+15%: "
-            f"{statistics['up_15']} "
-            f"({percent_count(statistics['up_15'])})"
-        )
-
-        lines.append("")
-
-        lines.append(
-            "📌 Медиана кейинги ҳаракат: "
-            f"{pct(statistics['median_final'])}"
-        )
-
-        lines.append(
-            "📌 Максимал юқори ҳаракат медианаси: "
-            f"{pct(statistics['median_max_up'])}"
-        )
-
-        lines.append(
-            "📌 Максимал паст ҳаракат медианаси: "
-            f"{pct(statistics['median_max_down'])}"
-        )
-
-    lines.append("")
-
-    lines.append(
-        "━━━━━━━━━━━━━━━━━━"
+    ctx = analysis.get(
+        "context",
+        {},
     )
 
-    lines.append(
-        "🎯 СЦЕНАРИЙ"
+    title = (
+        f"{symbol} | {timeframe} | "
+        f"{ctx.get('structure_state', '')}"
     )
 
-    lines.append(
-        f"Ҳозирги Price Action: "
-        f"{scenario['current_bias']}"
+    ax.set_title(title)
+
+    ax.set_xlabel(
+        "Ёпилган свечалар"
     )
 
-    lines.append(
-        f"Тарихий йўналиш: "
-        f"{scenario['historical_bias']}"
+    ax.set_ylabel(
+        "Нарх"
     )
 
-    lines.append(
-        f"Тарихий M/W: "
-        f"{scenario['m_w']}"
+    ax.grid(
+        alpha=0.2
     )
 
-    lines.append("")
+    fig.tight_layout()
 
-    lines.append(
-        "━━━━━━━━━━━━━━━━━━"
-    )
-
-    lines.append(
-        "🚦 SIGNAL HOLATI"
-    )
-
-    if gate["status"] == "LONG_WATCH":
-
-        lines.append(
-            "🟢 LONG КУЗАТУВ"
+    try:
+        fig.savefig(
+            path,
+            dpi=140,
         )
-
-    elif gate["status"] == "SHORT_WATCH":
-
-        lines.append(
-            "🔴 SHORT КУЗАТУВ"
-        )
-
-    else:
-
-        lines.append(
-            "⚠️ ҲОЗИРЧА КИРИШ ЙЎҚ"
-        )
-
-    lines.append(
-        f"Сабаб: {gate['reason']}"
-    )
-
-    lines.append("")
-
-    lines.append(
-        "❗ Бу натижа тарихий статистика."
-    )
-
-    lines.append(
-        "❗ Ҳеч қандай ҳаракат кафолатланмайди."
-    )
-
-    lines.append(
-        "❗ Киришдан олдин янги ёпилган шам "
-        "тасдиғи керак."
-    )
-
-    if analogues:
-
-        lines.append("")
-
-        lines.append(
-            "━━━━━━━━━━━━━━━━━━"
-        )
-
-        lines.append(
-            "🔎 ЭНГ ЎХШАШ ТАРИХИЙ ҲОЛАТЛАР"
-        )
-
-        for n, a in enumerate(
-            analogues[:TOP_ANALOGUES],
-            1
-        ):
-
-            dt = datetime.fromtimestamp(
-                candles[a.index].open_time / 1000,
-                timezone.utc
-            ).strftime(
-                "%Y-%m-%d %H:%M"
-            )
-
-            lines.append(
-                f"{n}. {dt} | "
-                f"ўхшашлик "
-                f"{a.similarity * 100:.1f}% | "
-                f"{a.first_direction} | "
-                f"кейин "
-                f"{pct(a.final_return)}"
-            )
-
-    return "\n".join(lines)
+        plt.close(fig)
+        return path
+    except Exception:
+        plt.close(fig)
+        return None
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-class Telegram:
+def telegram_api(
+    method,
+    data=None,
+    files=None,
+):
 
-    def __init__(self):
-        self.session = None
+    if not TELEGRAM_TOKEN:
+        return None
 
-    async def start(self):
+    url = (
+        "https://api.telegram.org/bot"
+        + TELEGRAM_TOKEN
+        + "/"
+        + method
+    )
 
-        if self.session is None:
+    try:
 
-            self.session = (
-                aiohttp.ClientSession()
-            )
-
-    async def close(self):
-
-        if self.session:
-            await self.session.close()
-
-        self.session = None
-
-    async def send(
-        self,
-        text: str
-    ):
-
-        if not TELEGRAM_BOT_TOKEN:
-            log(
-                "⚠️ TELEGRAM_BOT_TOKEN берилмаган."
-            )
-            return False
-
-        if not TELEGRAM_CHAT_ID:
-            log(
-                "⚠️ TELEGRAM_CHAT_ID берилмаган."
-            )
-            return False
-
-        await self.start()
-
-        url = (
-            "https://api.telegram.org/bot"
-            f"{TELEGRAM_BOT_TOKEN}"
-            "/sendMessage"
+        r = requests.post(
+            url,
+            data=data,
+            files=files,
+            timeout=30,
         )
 
-        payload = {
-            "chat_id":
+        if r.status_code != 200:
+            log.warning(
+                "Telegram %s: %s",
+                r.status_code,
+                r.text[:500],
+            )
+
+        return r
+
+    except Exception as exc:
+        log.warning(
+            "Telegram error: %s",
+            exc,
+        )
+
+    return None
+
+
+def telegram_send_text(text):
+
+    if (
+        not TELEGRAM_ENABLED
+        or not TELEGRAM_TOKEN
+        or not TELEGRAM_CHAT_ID
+    ):
+        return
+
+    # Telegram message limit.
+    chunks = [
+        text[i:i+3900]
+        for i in range(
+            0,
+            len(text),
+            3900,
+        )
+    ]
+
+    for chunk in chunks:
+
+        telegram_api(
+            "sendMessage",
+            data={
+                "chat_id":
                 TELEGRAM_CHAT_ID,
+                "text": chunk,
+                "disable_web_page_preview":
+                "true",
+            },
+        )
 
-            "text":
-                text,
 
-            "disable_web_page_preview":
-                True
-        }
+def telegram_send_photo(
+    photo_path,
+    caption,
+):
 
-        try:
+    if (
+        not TELEGRAM_ENABLED
+        or not TELEGRAM_TOKEN
+        or not TELEGRAM_CHAT_ID
+    ):
+        return
 
-            async with self.session.post(
-                url,
-                json=payload
-            ) as response:
+    try:
 
-                if response.status == 200:
-                    return True
+        with open(
+            photo_path,
+            "rb",
+        ) as f:
 
-                body = await response.text()
+            telegram_api(
+                "sendPhoto",
+                data={
+                    "chat_id":
+                    TELEGRAM_CHAT_ID,
+                    "caption":
+                    caption[:1000],
+                },
+                files={
+                    "photo": f
+                },
+            )
 
-                log(
-                    f"❌ Telegram xatosi: "
-                    f"{response.status} "
-                    f"{body[:300]}"
+    except Exception as exc:
+        log.warning(
+            "Telegram photo error: %s",
+            exc,
+        )
+
+
+# ============================================================
+# REPORT BUILDER
+# ============================================================
+
+def direction_icon(direction):
+
+    if direction == "UP":
+        return "🟢"
+
+    if direction == "DOWN":
+        return "🔴"
+
+    return "⚪"
+
+
+def tf_line(result):
+
+    if not result.get("ready"):
+        return (
+            f"{result.get('timeframe')}: "
+            f"⚪ маълумот етарли эмас"
+        )
+
+    return (
+        f"{result['timeframe']}: "
+        f"{direction_icon(result['combined'])} "
+        f"{result['combined']} | "
+        f"PA={result['pa_bias']} | "
+        f"HIST={result['hist_bias']}"
+    )
+
+
+def build_report(
+    symbol,
+    mtf,
+    gate,
+    scanner=None,
+    news=None,
+):
+
+    primary = None
+
+    # Prefer 15m.
+    if "15m" in mtf:
+        primary = mtf["15m"]
+
+    if primary is None:
+        primary = next(
+            iter(mtf.values()),
+            None,
+        )
+
+    if not primary:
+        return None
+
+    ctx = primary.get(
+        "context",
+        {},
+    )
+
+    stats = primary.get(
+        "stats",
+        {},
+    )
+
+    patterns = ctx.get(
+        "patterns",
+        [],
+    )
+
+    if not patterns:
+        patterns = [
+            "Аниқ свеча pattern топилмади"
+        ]
+
+    status = gate.get(
+        "status",
+        "WATCH",
+    )
+
+    direction = gate.get(
+        "direction",
+        "FLAT",
+    )
+
+    if status == "SIGNAL":
+        status_icon = "🚨"
+    elif status == "CONFIRMATION":
+        status_icon = "🟠"
+    else:
+        status_icon = "🟡"
+
+    lines = []
+
+    lines.append(
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    lines.append(
+        f"🧠 {APP_NAME}"
+    )
+
+    lines.append(
+        f"🪙 {symbol}"
+    )
+
+    lines.append(
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    lines.append(
+        f"💰 Нарх: {fmt_price(primary['price'])}"
+    )
+
+    lines.append(
+        f"📊 ҲОЛАТ: {ctx.get('structure_state', 'Нейтрал')}"
+    )
+
+    lines.append(
+        f"⚡ Импульс: {ctx.get('impulse_direction')} "
+        f"| {ctx.get('impulse_strength', 0):.2f}"
+    )
+
+    lines.append(
+        f"📦 Compression: "
+        f"{ctx.get('compression', 0) * 100:.1f}%"
+    )
+
+    lines.append(
+        f"💥 Breakout: "
+        f"{ctx.get('breakout_direction', 0)}"
+    )
+
+    lines.append(
+        f"↩️ Rejection: "
+        f"{ctx.get('rejection_direction', 0)}"
+    )
+
+    lines.append(
+        f"⚠️ Exhaustion: "
+        f"{ctx.get('exhaustion_direction', 0)}"
+    )
+
+    lines.append(
+        f"🕯 Patterns: "
+        f"{', '.join(patterns)}"
+    )
+
+    if ctx.get("mw"):
+        lines.append(
+            f"🔺 Pattern: {ctx['mw']}"
+        )
+
+    lines.append("")
+    lines.append(
+        "━━━━━━━━ ТАРИХИЙ АНАЛОГ ━━━━━━━━"
+    )
+
+    lines.append(
+        f"🔎 Ўхшаш ҳолатлар: "
+        f"{stats.get('total', 0)}"
+    )
+
+    lines.append(
+        f"🎯 Ўртача ўхшашлик: "
+        f"{stats.get('avg_similarity', 0) * 100:.1f}%"
+    )
+
+    lines.append(
+        f"🔴 DOWN: "
+        f"{stats.get('down', 0)} "
+        f"({stats.get('down_pct', 0):.1f}%)"
+    )
+
+    lines.append(
+        f"🟢 UP: "
+        f"{stats.get('up', 0)} "
+        f"({stats.get('up_pct', 0):.1f}%)"
+    )
+
+    lines.append(
+        f"⚪ FLAT: "
+        f"{stats.get('flat', 0)} "
+        f"({stats.get('flat_pct', 0):.1f}%)"
+    )
+
+    lines.append("")
+
+    targets = stats.get(
+        "targets",
+        {},
+    )
+
+    for level in [
+        -1,
+        -3,
+        -5,
+        -10,
+        -15,
+    ]:
+
+        t = targets.get(
+            level,
+            {},
+        )
+
+        lines.append(
+            f"📉 {level}%: "
+            f"{t.get('count', 0)} / "
+            f"{stats.get('total', 0)} = "
+            f"{t.get('pct', 0):.1f}%"
+        )
+
+    lines.append(
+        f"📈 Медиана close move: "
+        f"{stats.get('median_move', 0):+.2f}%"
+    )
+
+    lines.append("")
+    lines.append(
+        "━━━━━━━━ TIMEFRAME ━━━━━━━━"
+    )
+
+    for tf in TIMEFRAMES:
+        if tf in mtf:
+            lines.append(
+                tf_line(
+                    mtf[tf]
+                )
+            )
+
+    lines.append("")
+    lines.append(
+        "━━━━━━━━ СЦЕНАРИЙ ━━━━━━━━"
+    )
+
+    lines.append(
+        f"{status_icon} {status}"
+    )
+
+    lines.append(
+        f"Йўналиш: "
+        f"{direction}"
+    )
+
+    lines.append(
+        f"Timeframe agreement: "
+        f"{gate.get('agreement', 0) * 100:.1f}%"
+    )
+
+    lines.append(
+        f"Historical evidence: "
+        f"{gate.get('avg_hist', 0):.1f}%"
+    )
+
+    lines.append(
+        f"Historical analogues: "
+        f"{gate.get('avg_analogues', 0):.0f}"
+    )
+
+    lines.append(
+        f"Сабаб: {gate.get('reason', '')}"
+    )
+
+    if scanner:
+        breadth = market_breadth(
+            scanner
+        )
+
+        lines.append("")
+        lines.append(
+            "━━━━━━━━ MARKET BREADTH ━━━━━━━━"
+        )
+
+        lines.append(
+            f"🟢 UP: {breadth['up']:.1f}%"
+        )
+
+        lines.append(
+            f"🔴 DOWN: {breadth['down']:.1f}%"
+        )
+
+        lines.append(
+            f"⚪ FLAT: {breadth['flat']:.1f}%"
+        )
+
+    if news:
+
+        lines.append("")
+        lines.append(
+            "━━━━━━━━ 📰 NEWS / EVENT ━━━━━━━━"
+        )
+
+        for item in news[:3]:
+
+            title = item.title.strip()
+
+            if len(title) > 220:
+                title = title[:217] + "..."
+
+            lines.append(
+                f"• {title}"
+            )
+
+            if item.published:
+                lines.append(
+                    f"  Вақт: {item.published}"
                 )
 
-        except Exception as exc:
+    else:
 
-            log(
-                f"❌ Telegram ulanish xatosi: "
-                f"{exc}"
-            )
+        lines.append("")
+        lines.append(
+            "📰 News/Event: "
+            "релевант хабар топилмади"
+        )
 
-        return False
+    lines.append("")
+    lines.append(
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    lines.append(
+        "ℹ️ Бу тарихий статистик далил."
+    )
+
+    lines.append(
+        "❗ 100% кафолатланган прогноз эмас."
+    )
+
+    lines.append(
+        "ℹ️ Бот автоматик order очмайди."
+    )
+
+    lines.append(
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    return "\n".join(lines)
 
 
 # ============================================================
-# BOT
+# SIGNAL DEDUPLICATION
 # ============================================================
 
-class DeepMarketBot:
+def should_send_signal(
+    symbol,
+    gate,
+):
 
-    def __init__(self):
+    key = (
+        symbol,
+        ",".join(TIMEFRAMES),
+    )
 
-        self.binance = BinanceClient()
+    previous = LAST_SIGNAL.get(
+        key
+    )
 
-        self.telegram = Telegram()
+    now = time.time()
 
-        self.histories: Dict[
-            str,
-            Dict[str, List[Candle]]
-        ] = {}
-
-        self.indices: Dict[
-            str,
-            Dict[str, HistoricalIndex]
-        ] = {}
-
-        self.engines: Dict[
-            str,
-            Dict[str, AnalogueEngine]
-        ] = {}
-
-        self.last_analysis = {}
-
-        self.last_signal_time = {}
-
-        self.last_state = {}
-
-        self.running = True
-
-    # --------------------------------------------------------
-
-    async def build_history(self):
-
-        for symbol in SYMBOLS:
-
-            self.histories[symbol] = {}
-
-            self.indices[symbol] = {}
-
-            self.engines[symbol] = {}
-
-            for timeframe in TIMEFRAMES:
-
-                try:
-
-                    candles = await load_history(
-                        self.binance,
-                        symbol,
-                        timeframe
-                    )
-
-                    if len(candles) < (
-                        CONTEXT_CANDLES
-                        +
-                        FORWARD_CANDLES
-                        +
-                        50
-                    ):
-
-                        log(
-                            f"⚠️ {symbol} {timeframe}: "
-                            "тарих етарли эмас."
-                        )
-
-                        continue
-
-                    self.histories[
-                        symbol
-                    ][
-                        timeframe
-                    ] = candles
-
-                    index = HistoricalIndex(
-                        candles
-                    )
-
-                    index.build()
-
-                    self.indices[
-                        symbol
-                    ][
-                        timeframe
-                    ] = index
-
-                    self.engines[
-                        symbol
-                    ][
-                        timeframe
-                    ] = AnalogueEngine(
-                        candles,
-                        index
-                    )
-
-                except Exception as exc:
-
-                    log(
-                        f"❌ {symbol} {timeframe} "
-                        f"тарихий маълумот хато: "
-                        f"{exc}"
-                    )
-
-    # --------------------------------------------------------
-
-    async def analyse(
-        self,
-        symbol: str,
-        timeframe: str,
-        send_telegram=True
-    ):
-
-        candles = self.histories.get(
-            symbol,
-            {}
-        ).get(
-            timeframe
+    if previous:
+        elapsed = (
+            now - previous["time"]
         )
 
-        engine = self.engines.get(
-            symbol,
-            {}
-        ).get(
-            timeframe
+        same_direction = (
+            previous["direction"]
+            == gate["direction"]
         )
-
-        if not candles or not engine:
-            return None
-
-        current_index = (
-            len(candles) - 1
-        )
-
-        if current_index < (
-            CONTEXT_CANDLES + 5
-        ):
-            return None
-
-        analogues = engine.find(
-            current_index
-        )
-
-        report = make_report(
-            symbol,
-            timeframe,
-            candles,
-            current_index,
-            analogues
-        )
-
-        state = market_state(
-            candles,
-            current_index
-        )
-
-        key = (
-            f"{symbol}:{timeframe}"
-        )
-
-        previous_state = (
-            self.last_state.get(key)
-        )
-
-        changed = (
-            previous_state
-            != state
-        )
-
-        self.last_state[key] = state
 
         if (
-            send_telegram
-            and
-            changed
-            and
-            SEND_STATE_UPDATES
+            elapsed
+            < SIGNAL_COOLDOWN_MINUTES * 60
+            and same_direction
+            and gate["status"]
+            != "SIGNAL"
         ):
+            return False
 
-            await self.telegram.send(
-                report
-            )
+    # WATCH isn't sent repeatedly.
+    if gate["status"] == "WATCH":
+        return False
 
-        self.last_analysis[
-            key
-        ] = {
-            "time":
-                now_utc(),
+    LAST_SIGNAL[key] = {
+        "time": now,
+        "direction":
+            gate["direction"],
+        "status":
+            gate["status"],
+    }
 
-            "state":
-                state,
+    return True
 
-            "analogue_count":
-                len(analogues)
-        }
 
-        return {
-            "symbol":
-                symbol,
+# ============================================================
+# COMPLETE SYMBOL ANALYSIS
+# ============================================================
 
-            "timeframe":
-                timeframe,
+def analyze_symbol(
+    symbol,
+    send_telegram=True,
+):
 
-            "state":
-                state,
+    mtf = multi_timeframe_analysis(
+        symbol
+    )
 
-            "analogues":
-                len(analogues),
+    gate = signal_gate(
+        symbol,
+        mtf,
+    )
 
-            "report":
-                report
-        }
+    scanner = None
 
-    # --------------------------------------------------------
+    if MARKET_SCANNER_ENABLED:
+        scanner = market_scanner()
 
-    async def analyse_all(
-        self,
-        send_telegram=True
-    ):
+    news = []
 
-        results = []
-
-        for symbol in SYMBOLS:
-
-            for timeframe in TIMEFRAMES:
-
-                result = await self.analyse(
-                    symbol,
-                    timeframe,
-                    send_telegram
-                )
-
-                if result:
-                    results.append(
-                        result
-                    )
-
-        return results
-
-    # --------------------------------------------------------
-
-    async def refresh_timeframe(
-        self,
-        symbol: str,
-        timeframe: str
-    ):
-
-        candles = self.histories.get(
-            symbol,
-            {}
-        ).get(
-            timeframe
+    if NEWS_ENABLED:
+        news = relevant_news(
+            symbol
         )
 
-        if not candles:
-            return
+    report = build_report(
+        symbol,
+        mtf,
+        gate,
+        scanner,
+        news,
+    )
 
-        try:
+    if not report:
+        return
 
-            rows = await self.binance.klines(
-                symbol=symbol,
-                interval=timeframe,
-                limit=3
+    log.info(
+        "%s | %s | %s",
+        symbol,
+        gate["status"],
+        gate["direction"],
+    )
+
+    # Telegram only when meaningful.
+    if (
+        send_telegram
+        and should_send_signal(
+            symbol,
+            gate,
+        )
+    ):
+
+        telegram_send_text(
+            report
+        )
+
+        if CHART_ENABLED:
+
+            primary = mtf.get(
+                "15m"
             )
 
-            if not rows:
+            if primary and primary.get(
+                "ready"
+            ):
+
+                with DATA_LOCK:
+                    candles = list(
+                        MARKET_DATA[
+                            symbol
+                        ]["15m"]
+                    )
+
+                filename = (
+                    "/tmp/"
+                    + symbol
+                    + "_"
+                    + str(
+                        int(
+                            time.time()
+                        )
+                    )
+                    + ".png"
+                )
+
+                chart = make_chart(
+                    symbol,
+                    "15m",
+                    candles,
+                    primary,
+                    filename,
+                )
+
+                if chart:
+                    telegram_send_photo(
+                        chart,
+                        (
+                            f"{symbol} | "
+                            f"{gate['status']} | "
+                            f"{gate['direction']}"
+                        ),
+                    )
+
+
+# ============================================================
+# INITIAL HISTORY LOAD
+# ============================================================
+
+def history_days_for(tf):
+
+    if tf == "5m":
+        return HISTORY_DAYS_5M
+
+    if tf == "15m":
+        return HISTORY_DAYS_15M
+
+    if tf == "1h":
+        return HISTORY_DAYS_1H
+
+    # Generic fallback.
+    return 365
+
+
+def load_initial_history():
+
+    log.info(
+        "Loading Binance historical data..."
+    )
+
+    for symbol in SYMBOLS:
+
+        for tf in TIMEFRAMES:
+
+            if STOP:
                 return
 
-            for row in rows:
+            try:
 
-                candle = parse_kline(
-                    row
+                log.info(
+                    "Loading %s %s",
+                    symbol,
+                    tf,
                 )
 
-                # Фақат ёпилган шам
-                now_ms = int(
-                    time.time() * 1000
+                candles = fetch_klines(
+                    symbol,
+                    tf,
+                    history_days_for(
+                        tf
+                    ),
                 )
 
-                if candle.close_time > now_ms:
-                    continue
+                with DATA_LOCK:
+                    MARKET_DATA[
+                        symbol
+                    ][tf] = candles
+
+                log.info(
+                    "%s %s: %s candles",
+                    symbol,
+                    tf,
+                    len(candles),
+                )
+
+                if len(candles) >= 120:
+
+                    # Build historical index once.
+                    HISTORICAL.build_index(
+                        symbol,
+                        tf,
+                        candles,
+                    )
+
+            except Exception:
+                log.exception(
+                    "History load failed %s %s",
+                    symbol,
+                    tf,
+                )
+
+    log.info(
+        "Historical loading complete."
+    )
+
+
+# ============================================================
+# WEBSOCKET
+# ============================================================
+
+def websocket_streams():
+
+    streams = []
+
+    for symbol in SYMBOLS:
+
+        s = symbol.lower()
+
+        for tf in TIMEFRAMES:
+
+            streams.append(
+                f"{s}@kline_{tf}"
+            )
+
+    return streams
+
+
+def process_ws_message(message):
+
+    try:
+
+        payload = json.loads(
+            message
+        )
+
+        data = payload.get(
+            "data",
+            payload,
+        )
+
+        if data.get("e") != "kline":
+            return
+
+        k = data.get("k", {})
+
+        symbol = (
+            k.get("s", "")
+            .upper()
+        )
+
+        interval = k.get(
+            "i",
+            ""
+        )
+
+        # x == True means closed candle.
+        closed = bool(
+            k.get("x", False)
+        )
+
+        if not symbol or not interval:
+            return
+
+        candle = Candle(
+            open_time=int(
+                k["t"]
+            ),
+            open=float(
+                k["o"]
+            ),
+            high=float(
+                k["h"]
+            ),
+            low=float(
+                k["l"]
+            ),
+            close=float(
+                k["c"]
+            ),
+            volume=float(
+                k["v"]
+            ),
+            close_time=int(
+                k["T"]
+            ),
+        )
+
+        with DATA_LOCK:
+
+            candles = MARKET_DATA[
+                symbol
+            ][interval]
+
+            if candles:
 
                 if (
-                    candles
-                    and
-                    candle.open_time
-                    ==
                     candles[-1].open_time
+                    == candle.open_time
                 ):
-
                     candles[-1] = candle
 
                 elif (
-                    not candles
-                    or
                     candle.open_time
-                    >
-                    candles[-1].open_time
+                    > candles[-1].open_time
                 ):
-
                     candles.append(
                         candle
                     )
 
-            if len(candles) > LIVE_BUFFER:
+            else:
+                candles.append(
+                    candle
+                )
 
-                # Индекс билан аралашиб кетмаслиги учун
-                # live тарихни ҳозирча тўлиқ сақлаймиз.
-                #
-                # Railway Volume / RAM режимида кейин
-                # архивлаштиришни қўшиш мумкин.
+            # Keep memory bounded.
+            if len(candles) > MAX_CANDLES_MEMORY:
+                del candles[
+                    :-MAX_CANDLES_MEMORY
+                ]
 
-                pass
+        if closed:
 
-        except Exception as exc:
-
-            log(
-                f"⚠️ {symbol} {timeframe} "
-                f"янгилаш хато: {exc}"
+            log.info(
+                "CLOSED %s %s %s",
+                symbol,
+                interval,
+                fmt_price(
+                    candle.close
+                ),
             )
 
-    # --------------------------------------------------------
+            # Only analyze on candle close.
+            threading.Thread(
+                target=analyze_symbol,
+                args=(symbol, True),
+                daemon=True,
+            ).start()
 
-    async def polling_loop(self):
-
-        log(
-            "🔄 Live кузатув бошланди."
+    except Exception:
+        log.exception(
+            "WS message processing error"
         )
 
-        while self.running:
 
-            try:
+def websocket_worker():
 
-                for symbol in SYMBOLS:
+    reconnect_delay = 3
 
-                    for timeframe in TIMEFRAMES:
+    while not STOP:
 
-                        await self.refresh_timeframe(
-                            symbol,
-                            timeframe
-                        )
-
-                await self.analyse_all(
-                    send_telegram=True
-                )
-
-            except Exception as exc:
-
-                log(
-                    f"❌ Live цикл хато: {exc}"
-                )
-
-            await asyncio.sleep(
-                RESCAN_SECONDS
-            )
-
-    # --------------------------------------------------------
-
-    async def websocket_loop(self):
-
-        """
-        Binance WebSocket'дан реал вақт шамларини қабул қилиш.
-
-        Муҳим:
-        фақат kline 'x == true' бўлганда
-        шам тўлиқ ёпилган деб ҳисоблаймиз.
-        """
-
-        streams = []
-
-        for symbol in SYMBOLS:
-
-            for timeframe in TIMEFRAMES:
-
-                streams.append(
-                    f"{symbol.lower()}@kline_{timeframe}"
-                )
-
-        if not streams:
-            return
-
-        stream_url = (
-            BINANCE_WS.rstrip("/")
-            +
-            "/stream?streams="
-            +
-            "/".join(streams)
-        )
-
-        reconnect_delay = 5
-
-        while self.running:
-
-            try:
-
-                log(
-                    "🔌 Binance WebSocket "
-                    "уланмоқда..."
-                )
-
-                timeout = aiohttp.ClientTimeout(
-                    total=None
-                )
-
-                async with aiohttp.ClientSession(
-                    timeout=timeout
-                ) as session:
-
-                    async with session.ws_connect(
-                        stream_url,
-                        heartbeat=30
-                    ) as ws:
-
-                        log(
-                            "🟢 Binance WebSocket "
-                            "уланди."
-                        )
-
-                        reconnect_delay = 5
-
-                        async for message in ws:
-
-                            if not self.running:
-                                break
-
-                            if message.type != aiohttp.WSMsgType.TEXT:
-                                continue
-
-                            try:
-                                packet = json.loads(
-                                    message.data
-                                )
-                            except Exception:
-                                continue
-
-                            data = packet.get(
-                                "data",
-                                {}
-                            )
-
-                            k = data.get(
-                                "k",
-                                {}
-                            )
-
-                            # Шам ҳали ёпилмаган бўлса,
-                            # таҳлил қилмаймиз.
-                            if not k.get(
-                                "x",
-                                False
-                            ):
-                                continue
-
-                            symbol = k.get(
-                                "s"
-                            )
-
-                            timeframe = k.get(
-                                "i"
-                            )
-
-                            if (
-                                not symbol
-                                or
-                                not timeframe
-                            ):
-                                continue
-
-                            candles = (
-                                self.histories
-                                .get(
-                                    symbol,
-                                    {}
-                                )
-                                .get(
-                                    timeframe
-                                )
-                            )
-
-                            if candles is None:
-                                continue
-
-                            candle = Candle(
-                                open_time=int(
-                                    k["t"]
-                                ),
-
-                                close_time=int(
-                                    k["T"]
-                                ),
-
-                                open=float(
-                                    k["o"]
-                                ),
-
-                                high=float(
-                                    k["h"]
-                                ),
-
-                                low=float(
-                                    k["l"]
-                                ),
-
-                                close=float(
-                                    k["c"]
-                                ),
-
-                                volume=float(
-                                    k["v"]
-                                ),
-
-                                quote_volume=float(
-                                    k.get(
-                                        "q",
-                                        0
-                                    )
-                                ),
-
-                                trades=int(
-                                    k.get(
-                                        "n",
-                                        0
-                                    )
-                                )
-                            )
-
-                            if (
-                                candles
-                                and
-                                candle.open_time
-                                ==
-                                candles[-1].open_time
-                            ):
-
-                                candles[-1] = candle
-
-                            elif (
-                                not candles
-                                or
-                                candle.open_time
-                                >
-                                candles[-1].open_time
-                            ):
-
-                                candles.append(
-                                    candle
-                                )
-
-                            log(
-                                f"🕯 {symbol} "
-                                f"{timeframe} "
-                                f"ёпилди: "
-                                f"{candle.close}"
-                            )
-
-                            # Live index'ни янги candle билан
-                            # қайта қуриш шарт эмас.
-                            #
-                            # Ҳозирги таҳлил:
-                            # тарихий индекс +
-                            # янги жорий ҳолат.
-                            #
-                            # Кейинги версияда incremental
-                            # index қўшилади.
-
-                            result = await self.analyse(
-                                symbol,
-                                timeframe,
-                                send_telegram=True
-                            )
-
-                            if result:
-
-                                log(
-                                    f"📊 {symbol} "
-                                    f"{timeframe}: "
-                                    f"{result['state']} | "
-                                    f"аналоглар: "
-                                    f"{result['analogues']}"
-                                )
-
-            except Exception as exc:
-
-                log(
-                    f"🔴 WebSocket узилди: "
-                    f"{exc}"
-                )
-
-                if self.running:
-
-                    log(
-                        f"🔄 {reconnect_delay} "
-                        "секундан кейин қайта уланамиз..."
-                    )
-
-                    await asyncio.sleep(
-                        reconnect_delay
-                    )
-
-                    reconnect_delay = min(
-                        reconnect_delay * 2,
-                        60
-                    )
-
-    # --------------------------------------------------------
-
-    async def periodic_rescan(self):
-
-        while self.running:
-
-            await asyncio.sleep(
-                RESCAN_SECONDS
-            )
-
-            try:
-
-                log(
-                    "🔍 Чуқур қайта скан бошланди..."
-                )
-
-                await self.analyse_all(
-                    send_telegram=False
-                )
-
-                log(
-                    "✅ Қайта скан тугади."
-                )
-
-            except Exception as exc:
-
-                log(
-                    f"❌ Қайта скан хато: "
-                    f"{exc}"
-                )
-
-    # --------------------------------------------------------
-
-    async def save_state(self):
-
-        os.makedirs(
-            DATA_DIR,
-            exist_ok=True
-        )
-
-        data = {
-            "time":
-                now_utc(),
-
-            "symbols":
-                SYMBOLS,
-
-            "timeframes":
-                TIMEFRAMES,
-
-            "last_analysis":
-                self.last_analysis,
-
-            "last_state":
-                self.last_state
-        }
-
-        path = os.path.join(
-            DATA_DIR,
-            RESULT_FILE
-        )
+        ws = None
 
         try:
 
-            with open(
-                path,
-                "w",
-                encoding="utf-8"
-            ) as f:
+            streams = websocket_streams()
 
-                json.dump(
-                    data,
-                    f,
-                    ensure_ascii=False,
-                    indent=2
+            if not streams:
+                raise RuntimeError(
+                    "No websocket streams"
                 )
 
-        except Exception as exc:
-
-            log(
-                f"⚠️ Ҳолатни сақлаш хато: "
-                f"{exc}"
+            url = (
+                BINANCE_WS
+                + "?streams="
+                + "/".join(streams)
             )
 
-    # --------------------------------------------------------
-
-    async def run(self):
-
-        log(
-            "================================================"
-        )
-
-        log(
-            "🚀 DEEP HISTORICAL MARKET BOT"
-        )
-
-        log(
-            "🚀 Бот ишга тушмоқда..."
-        )
-
-        log(
-            f"Символлар: {', '.join(SYMBOLS)}"
-        )
-
-        log(
-            f"Timeframe: {', '.join(TIMEFRAMES)}"
-        )
-
-        log(
-            f"Контекст: {CONTEXT_CANDLES} шам"
-        )
-
-        log(
-            f"Кейинги ҳаракат: "
-            f"{FORWARD_CANDLES} шам"
-        )
-
-        log(
-            "================================================"
-        )
-
-        await self.build_history()
-
-        if not self.histories:
-
-            raise RuntimeError(
-                "Ҳеч қандай тарихий маълумот "
-                "тайёрланмади."
+            log.info(
+                "Connecting Binance WebSocket..."
             )
 
-        # Бошланғич таҳлил
-        try:
-
-            results = await self.analyse_all(
-                send_telegram=True
+            ws = websocket.WebSocketApp(
+                url,
+                on_open=lambda w:
+                    log.info(
+                        "Binance WebSocket connected"
+                    ),
+                on_message=lambda w, msg:
+                    process_ws_message(
+                        msg
+                    ),
+                on_error=lambda w, err:
+                    log.warning(
+                        "WebSocket error: %s",
+                        err,
+                    ),
+                on_close=lambda w, code, msg:
+                    log.warning(
+                        "WebSocket closed: %s %s",
+                        code,
+                        msg,
+                    ),
             )
 
-            log(
-                f"📊 Бошланғич таҳлил: "
-                f"{len(results)} та."
+            # Binance requires long-lived connection
+            # management and reconnection.
+            ws.run_forever(
+                ping_interval=120,
+                ping_timeout=30,
+                reconnect=5,
             )
 
-        except Exception as exc:
-
-            log(
-                f"⚠️ Бошланғич таҳлил хато: "
-                f"{exc}"
-            )
-
-        await self.save_state()
-
-        # WebSocket + periodic rescan
-        tasks = [
-            asyncio.create_task(
-                self.websocket_loop()
-            ),
-
-            asyncio.create_task(
-                self.periodic_rescan()
-            )
-        ]
-
-        try:
-
-            await asyncio.gather(
-                *tasks
+        except Exception:
+            log.exception(
+                "WebSocket worker crashed"
             )
 
         finally:
 
-            for task in tasks:
-                task.cancel()
+            try:
+                if ws:
+                    ws.close()
+            except Exception:
+                pass
 
-            await self.telegram.close()
+        if STOP:
+            break
 
-            await self.binance.close()
+        log.info(
+            "Reconnecting Binance WebSocket in %ss",
+            reconnect_delay,
+        )
 
-            await self.save_state()
+        sleep_interruptible(
+            reconnect_delay
+        )
 
-    # --------------------------------------------------------
+        reconnect_delay = min(
+            reconnect_delay * 2,
+            60,
+        )
 
-    def stop(self):
 
-        if self.running:
+# ============================================================
+# BACKGROUND RESCAN
+# ============================================================
 
-            log(
-                "🛑 Ботни тўхтатиш сигнали олинди."
+def analysis_loop():
+
+    while not STOP:
+
+        try:
+
+            for symbol in SYMBOLS:
+
+                if STOP:
+                    break
+
+                analyze_symbol(
+                    symbol,
+                    send_telegram=True,
+                )
+
+                sleep_interruptible(
+                    2
+                )
+
+        except Exception:
+            log.exception(
+                "Analysis loop error"
             )
 
-        self.running = False
+        sleep_interruptible(
+            SCAN_SECONDS
+        )
+
+
+def news_loop():
+
+    while not STOP:
+
+        try:
+
+            if NEWS_ENABLED:
+                refresh_news()
+
+        except Exception:
+            log.exception(
+                "News loop error"
+            )
+
+        sleep_interruptible(
+            NEWS_SCAN_SECONDS
+        )
+
+
+def market_loop():
+
+    while not STOP:
+
+        try:
+
+            scanner = market_scanner()
+
+            breadth = market_breadth(
+                scanner
+            )
+
+            log.info(
+                "MARKET | UP %.1f%% | DOWN %.1f%% | FLAT %.1f%%",
+                breadth["up"],
+                breadth["down"],
+                breadth["flat"],
+            )
+
+        except Exception:
+            log.exception(
+                "Market scanner error"
+            )
+
+        sleep_interruptible(
+            MARKET_SCAN_SECONDS
+        )
+
+
+# ============================================================
+# TELEGRAM STARTUP
+# ============================================================
+
+def startup_message():
+
+    if not TELEGRAM_ENABLED:
+        return
+
+    if not TELEGRAM_TOKEN:
+        return
+
+    text = f"""
+🧠 {APP_NAME}
+
+✅ Сервер ишга тушди.
+
+Версия:
+{VERSION}
+
+🪙 Symbols:
+{", ".join(SYMBOLS)}
+
+⏱ Timeframes:
+{", ".join(TIMEFRAMES)}
+
+🔎 Historical Analogue:
+ON
+
+📊 Market Scanner:
+{"ON" if MARKET_SCANNER_ENABLED else "OFF"}
+
+📰 News/Event:
+{"ON" if NEWS_ENABLED else "OFF"}
+
+📈 Chart:
+{"ON" if CHART_ENABLED else "OFF"}
+
+🟢 Binance WebSocket:
+ON
+
+🔁 Auto Reconnect:
+ON
+
+🚫 Автоматик order:
+OFF
+
+Бот Price Action + тарихи аналоглар
+асосида мониторинг бошлади.
+"""
+
+    telegram_send_text(
+        text.strip()
+    )
+
+
+# ============================================================
+# HEALTH CHECK HTTP SERVER
+# ============================================================
+#
+# Railway web-service health / port detection.
+# ============================================================
+
+from http.server import (
+    BaseHTTPRequestHandler,
+    HTTPServer,
+)
+
+
+PORT = int(
+    os.getenv(
+        "PORT",
+        "8080",
+    )
+)
+
+
+class HealthHandler(
+    BaseHTTPRequestHandler
+):
+
+    def do_GET(self):
+
+        body = {
+            "status": "ok",
+            "app": APP_NAME,
+            "version": VERSION,
+            "uptime_seconds":
+                int(
+                    time.time()
+                    - SESSION_START
+                ),
+            "symbols": SYMBOLS,
+            "timeframes":
+                TIMEFRAMES,
+            "historical_indexes":
+                len(
+                    HISTORICAL.cache
+                ),
+        }
+
+        payload = json.dumps(
+            body,
+            ensure_ascii=False,
+        ).encode(
+            "utf-8"
+        )
+
+        self.send_response(
+            200
+        )
+
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8",
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(payload)),
+        )
+
+        self.end_headers()
+
+        self.wfile.write(
+            payload
+        )
+
+    def log_message(
+        self,
+        format,
+        *args,
+    ):
+        return
+
+
+def health_server():
+
+    server = HTTPServer(
+        ("0.0.0.0", PORT),
+        HealthHandler,
+    )
+
+    log.info(
+        "Health server listening on %s",
+        PORT,
+    )
+
+    while not STOP:
+
+        server.handle_request()
+
+
+# ============================================================
+# SHUTDOWN
+# ============================================================
+
+def shutdown(
+    signum=None,
+    frame=None,
+):
+
+    global STOP
+
+    if STOP:
+        return
+
+    STOP = True
+
+    log.info(
+        "Shutdown requested."
+    )
+
+
+signal.signal(
+    signal.SIGINT,
+    shutdown,
+)
+
+signal.signal(
+    signal.SIGTERM,
+    shutdown,
+)
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-BOT = None
+def main():
 
-
-def handle_signal(
-    signum,
-    frame
-):
-
-    global BOT
-
-    if BOT:
-
-        BOT.stop()
-
-
-async def main():
-
-    global BOT
-
-    BOT = DeepMarketBot()
-
-    signal.signal(
-        signal.SIGINT,
-        handle_signal
+    log.info(
+        "======================================"
     )
 
-    signal.signal(
-        signal.SIGTERM,
-        handle_signal
+    log.info(
+        "%s",
+        APP_NAME,
     )
 
-    await BOT.run()
+    log.info(
+        "Version %s",
+        VERSION,
+    )
+
+    log.info(
+        "Symbols: %s",
+        SYMBOLS,
+    )
+
+    log.info(
+        "Timeframes: %s",
+        TIMEFRAMES,
+    )
+
+    log.info(
+        "======================================"
+    )
+
+    # Initial news.
+    if NEWS_ENABLED:
+        try:
+            refresh_news()
+        except Exception:
+            log.exception(
+                "Initial news scan failed"
+            )
+
+    # Historical Binance data.
+    load_initial_history()
+
+    # Telegram startup.
+    startup_message()
+
+    # Health endpoint.
+    threading.Thread(
+        target=health_server,
+        daemon=True,
+    ).start()
+
+    # Binance real-time stream.
+    threading.Thread(
+        target=websocket_worker,
+        daemon=True,
+    ).start()
+
+    # Historical/periodic analysis.
+    threading.Thread(
+        target=analysis_loop,
+        daemon=True,
+    ).start()
+
+    # News.
+    threading.Thread(
+        target=news_loop,
+        daemon=True,
+    ).start()
+
+    # Market scanner.
+    threading.Thread(
+        target=market_loop,
+        daemon=True,
+    ).start()
+
+    log.info(
+        "BOT IS LIVE."
+    )
+
+    while not STOP:
+        time.sleep(2)
+
+    log.info(
+        "BOT STOPPED."
+    )
 
 
 if __name__ == "__main__":
-
     try:
-
-        asyncio.run(
-            main()
-        )
-
+        main()
     except KeyboardInterrupt:
-
-        print(
-            "\n🛑 Бот тўхтатилди."
+        shutdown()
+    except Exception:
+        log.exception(
+            "FATAL ERROR"
         )
+        raise
+PY
 
-    except Exception as exc:
-
-        print(
-            f"\n🔴 Критик хато: {exc}",
-            file=sys.stderr
-        )
-
-        sys.exit(1)
+echo
+echo "=========================================="
+echo " DEEP MARKET BOT CREATED"
+echo "=========================================="
+echo
+echo "Folder:"
+pwd
+echo
+echo "Files:"
+ls -lh
+echo
+echo "Next:"
+echo "1) GitHub repositoryga deep-market-bot papkasini yuklang."
+echo "2) Railway -> New Project -> Deploy from GitHub Repo."
+echo "3) Railway Variables ga TELEGRAM_BOT_TOKEN va TELEGRAM_CHAT_ID kiriting."
+echo "4) Deploy qiling."
+echo
