@@ -12,6 +12,7 @@ import logging
 import threading
 import traceback
 import statistics
+import re
 import xml.etree.ElementTree as ET
 
 from dataclasses import dataclass
@@ -1635,6 +1636,8 @@ def analogue_statistics(
             "median_up": 0.0,
             "median_down": 0.0,
             "targets": {},
+            "profit_targets": {},
+            "loss_targets": {},
             "avg_similarity": 0.0
         }
 
@@ -1675,12 +1678,16 @@ def analogue_statistics(
 
     for target in (
         -1,
+        -2,
         -3,
+        -4,
         -5,
         -10,
         -15,
         1,
+        2,
         3,
+        4,
         5,
         10,
         15
@@ -1708,6 +1715,62 @@ def analogue_statistics(
             )
         }
 
+    # ========================================================
+    # QO'SHIMCHA 1: +1%, +2%, +3%, +4%
+    # ========================================================
+
+    profit_targets = {}
+
+    for target in (
+        1,
+        2,
+        3,
+        4
+    ):
+        hits = sum(
+            1
+            for a in analogues
+            if a.max_up >= target
+        )
+
+        profit_targets[target] = {
+            "count": hits,
+            "total": total,
+            "pct": (
+                hits
+                / total
+                * 100.0
+            )
+        }
+
+    # ========================================================
+    # QO'SHIMCHA 1: -1%, -2%, -3%, -4%
+    # ========================================================
+
+    loss_targets = {}
+
+    for target in (
+        1,
+        2,
+        3,
+        4
+    ):
+        hits = sum(
+            1
+            for a in analogues
+            if a.max_down <= -target
+        )
+
+        loss_targets[target] = {
+            "count": hits,
+            "total": total,
+            "pct": (
+                hits
+                / total
+                * 100.0
+            )
+        }
+
     return {
         "total": total,
         "up": up,
@@ -1723,6 +1786,14 @@ def analogue_statistics(
         "median_down":
             median_or_zero(down_moves),
         "targets": targets,
+
+        # QO'SHIMCHA STATISTIKALAR
+        "profit_targets":
+            profit_targets,
+
+        "loss_targets":
+            loss_targets,
+
         "avg_similarity":
             mean_or_zero([
                 a.similarity
@@ -2228,6 +2299,131 @@ def strip_xml(text):
     )
 
 
+# ============================================================
+# QO'SHIMCHA: NEWS TARJIMA CACHE
+# ============================================================
+
+TRANSLATION_CACHE = {}
+
+TRANSLATION_LOCK = threading.RLock()
+
+
+def clean_translation_text(text):
+    if not text:
+        return ""
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+    return text.strip()
+
+
+def translate_news_to_uzbek(text):
+    """
+    RSS orqali kelgan inglizcha yangilik sarlavhasini
+    o'zbek tiliga tarjima qiladi.
+
+    Tarjima servisi ishlamasa, original sarlavha
+    qaytariladi. Bot ishlashdan to'xtamaydi.
+    """
+
+    text = clean_translation_text(
+        text
+    )
+
+    if not text:
+        return text
+
+    cache_key = text.lower()
+
+    with TRANSLATION_LOCK:
+        cached = TRANSLATION_CACHE.get(
+            cache_key
+        )
+
+    if cached:
+        return cached
+
+    try:
+        response = HTTP_SESSION.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={
+                "client": "gtx",
+                "sl": "auto",
+                "tl": "uz",
+                "dt": "t",
+                "q": text
+            },
+            timeout=REQUEST_TIMEOUT
+        )
+
+        if response.status_code != 200:
+            log.warning(
+                "News tarjima HTTP xato: %s",
+                response.status_code
+            )
+
+            return text
+
+        data = response.json()
+
+        translated_parts = []
+
+        if (
+            isinstance(data, list)
+            and len(data) > 0
+            and isinstance(data[0], list)
+        ):
+            for part in data[0]:
+                if (
+                    isinstance(part, list)
+                    and len(part) > 0
+                    and part[0]
+                ):
+                    translated_parts.append(
+                        str(part[0])
+                    )
+
+        translated = clean_translation_text(
+            " ".join(
+                translated_parts
+            )
+        )
+
+        if not translated:
+            return text
+
+        with TRANSLATION_LOCK:
+            TRANSLATION_CACHE[
+                cache_key
+            ] = translated
+
+            if len(TRANSLATION_CACHE) > 1000:
+                first_key = next(
+                    iter(
+                        TRANSLATION_CACHE
+                    )
+                )
+
+                TRANSLATION_CACHE.pop(
+                    first_key,
+                    None
+                )
+
+        return translated
+
+    except Exception as exc:
+        log.warning(
+            "News tarjimasida xato: %s",
+            exc
+        )
+
+        return text
+
+
 def parse_rss(url):
     response = requests.get(
         url,
@@ -2311,7 +2507,22 @@ def refresh_news():
             key = item.title.strip().lower()
 
             if key:
-                unique[key] = item
+                # =================================================
+                # QO'SHIMCHA: INGLIZCHA NEWS -> O'ZBEKCHA
+                # =================================================
+
+                translated_title = (
+                    translate_news_to_uzbek(
+                        item.title
+                    )
+                )
+
+                unique[key] = NewsItem(
+                    title=translated_title,
+                    link=item.link,
+                    published=item.published,
+                    source=item.source
+                )
 
         NEWS_CACHE = list(
             unique.values()
@@ -2811,6 +3022,68 @@ def build_report(
 
             lines.append(
                 f"{target}%: "
+                f"{item.get('pct', 0):.2f}%"
+            )
+
+        # ====================================================
+        # QO'SHIMCHA: +1%, +2%, +3%, +4% STATISTIKA
+        # ====================================================
+
+        profit_targets = stats.get(
+            "profit_targets",
+            {}
+        )
+
+        loss_targets = stats.get(
+            "loss_targets",
+            {}
+        )
+
+        lines.append("")
+
+        lines.append(
+            "🎯 TARIXDA FOYDA YETISH STATISTIKASI:"
+        )
+
+        for target in (
+            1,
+            2,
+            3,
+            4
+        ):
+            item = profit_targets.get(
+                target,
+                {}
+            )
+
+            lines.append(
+                f"+{target}% → "
+                f"{item.get('count', 0)} marta / "
+                f"{item.get('total', 0)} ta = "
+                f"{item.get('pct', 0):.2f}%"
+            )
+
+        lines.append("")
+
+        lines.append(
+            "📉 TARIXDA PASTGA YETISH STATISTIKASI:"
+        )
+
+        for target in (
+            1,
+            2,
+            3,
+            4
+        ):
+            item = loss_targets.get(
+                target,
+                {}
+            )
+
+            lines.append(
+                f"-{target}% → "
+                f"{item.get('count', 0)} marta / "
+                f"{item.get('total', 0)} ta = "
                 f"{item.get('pct', 0):.2f}%"
             )
 
