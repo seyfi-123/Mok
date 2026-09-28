@@ -64,7 +64,7 @@ ELITE_MAX = _i("ELITE_MAX", 10)
 ELITE_MIN = _i("ELITE_MIN", 3)           # 1 ga tushirsa bo'ladi, lekin ishonchsiz
 ELITE_AGREE = _f("ELITE_AGREE", 0.70)    # elite'ning shu qismi signal tomoniga mos bo'lishi shart
 # Signal gate
-MIN_WIN_LB = _f("MIN_WIN_LB", 0.53)
+MIN_WIN_LB = _f("MIN_WIN_LB", 0.40)
 EDGE_OVER_BASE = _f("EDGE_OVER_BASE", 0.02)
 MIN_EXP = _f("MIN_EXP_R", 0.05)
 MIN_TF = _i("MIN_TF_AGREE", 2)
